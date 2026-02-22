@@ -13,6 +13,7 @@ desktop-dst := share-dst / 'applications' / appid + '.desktop'
 metainfo-dst := share-dst / 'metainfo' / appid + '.metainfo.xml'
 icon-dst := share-dst / 'icons/hicolor/scalable/apps' / appid + '-symbolic.svg'
 schema-dst := share-dst / 'configurator' / appid + '.json'
+dbus-dst := share-dst / 'dbus-1/services/io.github.cosmic_utils.ClipboardManager.service'
 
 default: build-release
 
@@ -30,16 +31,18 @@ install:
     install -Dm0644 res/desktop_entry.desktop {{ desktop-dst }}
     install -Dm0644 res/metainfo.xml {{ metainfo-dst }}
     install -Dm0644 res/app_icon.svg {{ icon-dst }}
+    install -Dm0644 res/io.github.cosmic_utils.ClipboardManager.service {{ dbus-dst }}
 
 install-schema:
     install -Dm0644 res/config_schema.json {{ schema-dst }}
 
 uninstall:
     rm -f {{ bin-dst }}
-    rm -f {{ desktop-dst }} 
+    rm -f {{ desktop-dst }}
     rm -f {{ icon-dst }}
     rm -f {{ schema-dst }}
     rm -f {{ metainfo-dst }}
+    rm -f {{ dbus-dst }}
 
 clean:
     cargo clean
