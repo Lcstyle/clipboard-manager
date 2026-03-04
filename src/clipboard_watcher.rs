@@ -372,9 +372,18 @@ impl Watcher {
                     return Err(Error::ClipboardEmpty);
                 };
 
+                // X11 ICCCM protocol atoms — not data formats, requesting them
+                // via receive() causes XWayland apps (e.g. Chrome) to seize up.
+                const SKIP_MIME_TYPES: &[&str] =
+                    &["SAVE_TARGETS", "TARGETS", "MULTIPLE", "TIMESTAMP", "COMPOUND_TEXT"];
+
                 let mut res = Vec::with_capacity(mime_types.len());
 
                 for mime_type in mime_types {
+                    if SKIP_MIME_TYPES.contains(&mime_type.as_str()) {
+                        continue;
+                    }
+
                     // Create a pipe for content transfer.
                     let (write, read) =
                         tokio::net::unix::pipe::pipe().map_err(Error::PipeCreation)?;

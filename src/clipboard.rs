@@ -7,7 +7,7 @@ use std::{
 };
 
 use cosmic::iced::{futures::SinkExt, stream::channel};
-use futures::Stream;
+use futures::{Stream, future::join_all};
 use itertools::Itertools;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 
@@ -81,36 +81,35 @@ pub fn sub() -> impl Stream<Item = ClipboardMessage> {
 
                         match rx.recv().await {
                             Some(WatchRes::Some(res)) => {
-                                let mut data = MimeDataMap::new();
-
-                                for (mime_type, mut pipe) in res {
+                                let reads = res.into_iter().map(|(mime_type, mut pipe)| async move {
                                     let mut contents = Vec::new();
-
                                     match tokio::time::timeout(
                                         Duration::from_millis(500),
                                         pipe.read_to_end(&mut contents),
                                     )
                                     .await
                                     {
-                                        Ok(Ok(len)) => {
-                                            if len == 0 {
-                                                debug!("data is empty: {mime_type}");
-                                            } else {
-                                                data.insert(mime_type, contents);
-                                            }
+                                        Ok(Ok(len)) if len > 0 => Some((mime_type, contents)),
+                                        Ok(Ok(_)) => {
+                                            debug!("data is empty: {mime_type}");
+                                            None
                                         }
                                         Ok(Err(e)) => {
-                                            warn!(
-                                                "read error on external pipe clipboard: {mime_type} {e}"
-                                            );
+                                            warn!("read error on external pipe clipboard: {mime_type} {e}");
+                                            None
                                         }
                                         Err(e) => {
-                                            warn!(
-                                                "read timeout on external pipe clipboard: {mime_type} {e}"
-                                            );
+                                            warn!("read timeout on external pipe clipboard: {mime_type} {e}");
+                                            None
                                         }
                                     }
-                                }
+                                });
+
+                                let data: MimeDataMap = join_all(reads)
+                                    .await
+                                    .into_iter()
+                                    .flatten()
+                                    .collect();
 
                                 if !data.is_empty() {
                                     let mimes = data
@@ -197,36 +196,35 @@ pub fn primary_sub() -> impl Stream<Item = ClipboardMessage> {
                     loop {
                         match rx.recv().await {
                             Some(WatchRes::Some(res)) => {
-                                let mut data = MimeDataMap::new();
-
-                                for (mime_type, mut pipe) in res {
+                                let reads = res.into_iter().map(|(mime_type, mut pipe)| async move {
                                     let mut contents = Vec::new();
-
                                     match tokio::time::timeout(
                                         Duration::from_millis(500),
                                         pipe.read_to_end(&mut contents),
                                     )
                                     .await
                                     {
-                                        Ok(Ok(len)) => {
-                                            if len == 0 {
-                                                debug!("primary: data is empty: {mime_type}");
-                                            } else {
-                                                data.insert(mime_type, contents);
-                                            }
+                                        Ok(Ok(len)) if len > 0 => Some((mime_type, contents)),
+                                        Ok(Ok(_)) => {
+                                            debug!("primary: data is empty: {mime_type}");
+                                            None
                                         }
                                         Ok(Err(e)) => {
-                                            warn!(
-                                                "primary: read error on pipe: {mime_type} {e}"
-                                            );
+                                            warn!("primary: read error on pipe: {mime_type} {e}");
+                                            None
                                         }
                                         Err(e) => {
-                                            warn!(
-                                                "primary: read timeout on pipe: {mime_type} {e}"
-                                            );
+                                            warn!("primary: read timeout on pipe: {mime_type} {e}");
+                                            None
                                         }
                                     }
-                                }
+                                });
+
+                                let data: MimeDataMap = join_all(reads)
+                                    .await
+                                    .into_iter()
+                                    .flatten()
+                                    .collect();
 
                                 if !data.is_empty() {
                                     output.send(ClipboardMessage::Data(data)).await.unwrap();
