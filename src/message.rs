@@ -68,6 +68,8 @@ pub enum AppMsg {
         position: cosmic::iced_core::Point,
         target: crate::app::PopupKind,
     },
+    /// Logical screen size from a wayland output event, used to clamp popup position.
+    OutputSize(f32, f32),
     /// No longer used — kept to avoid breaking handler match.
     #[allow(dead_code)]
     OpenPositionedPopup {

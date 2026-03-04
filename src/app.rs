@@ -91,6 +91,9 @@ pub struct AppState<Db: DbTrait> {
     /// Cursor position for layer surface popups (content is positioned here
     /// within the fullscreen overlay surface).
     popup_position: Option<cosmic::iced_core::Point>,
+    /// Logical screen size from the most recently seen wayland output, used
+    /// to clamp layer surface popup position to keep it fully on-screen.
+    screen_size: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +588,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             cursor_capture: None,
             suppress_unfocus: false,
             popup_position: None,
+            screen_size: None,
             preferred_mime_types_regex: config
                 .preferred_mime_types
                 .iter()
@@ -657,6 +661,9 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     self.popup_position = Some(position);
                     self.suppress_unfocus = true;
                 }
+            }
+            AppMsg::OutputSize(w, h) => {
+                self.screen_size = Some((w, h));
             }
             AppMsg::OpenPositionedPopup { .. } => {
                 // Unused — kept for message enum compatibility.
@@ -1449,17 +1456,31 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 .max_height(530.0);
 
             let outer = if let Some(pos) = self.popup_position {
-                // Position popup at cursor coordinates using padding
+                // Clamp so the popup stays fully on-screen when cursor is near an edge.
+                let popup_w = match popup.kind {
+                    PopupKind::Favorites => 1200.0,
+                    _ => 400.0,
+                };
+                let popup_h = 530.0;
+                let (left, top) = if let Some((sw, sh)) = self.screen_size {
+                    (
+                        pos.x.min(sw - popup_w).max(0.0),
+                        pos.y.min(sh - popup_h).max(0.0),
+                    )
+                } else {
+                    (pos.x, pos.y)
+                };
+
                 cosmic::widget::container(styled)
                     .width(cosmic::iced::Length::Fill)
                     .height(cosmic::iced::Length::Fill)
                     .align_x(cosmic::iced::Alignment::Start)
                     .align_y(cosmic::iced::Alignment::Start)
                     .padding(cosmic::iced::Padding {
-                        top: pos.y,
+                        top,
                         right: 0.0,
                         bottom: 0.0,
-                        left: pos.x,
+                        left,
                     })
             } else {
                 // Center fallback (no cursor position captured)
@@ -1487,6 +1508,22 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             navigation::sub().map(AppMsg::Navigation),
             db_sub().map(AppMsg::Db),
             ipc::dbus_toggle_subscription(),
+            cosmic::iced_futures::event::listen_with(|event, _, _| {
+                use cosmic::iced::event::{PlatformSpecific, wayland};
+                let cosmic::iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
+                    wayland::Event::Output(output_event, _),
+                )) = event
+                else {
+                    return None;
+                };
+                let info = match output_event {
+                    wayland::OutputEvent::Created(Some(info)) => info,
+                    wayland::OutputEvent::InfoUpdate(info) => info,
+                    _ => return None,
+                };
+                info.logical_size
+                    .map(|(w, h)| AppMsg::OutputSize(w as f32, h as f32))
+            }),
         ];
 
         // Editor process IPC subscription
