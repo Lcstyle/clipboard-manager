@@ -50,6 +50,7 @@ misanthropy = "0.0.8"
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
+rev = "754b064bffbb399b955662d6c1fcca3468accb0c"
 default-features = false
 features = ["applet", "tokio", "wayland", "qr_code", "markdown", "highlighter"]
 
@@ -61,11 +62,11 @@ tokio = { version = "1", features = ["macros"] }
 
 [profile.release-lto]
 inherits = "release"
-lto = "fat"
+lto = "thin"
 
 [patch."https://github.com/pop-os/libcosmic".libcosmic]
 git = "https://github.com/Lcstyle/libcosmic.git"
-branch = "fix/v3-fatal-sctk-dispatch-did"
+rev = "fb08d15fec025ab789d3c99718661d18d05b321f"
 
 [patch."https://github.com/smithay/client-toolkit.git"]
 sctk = { package = "smithay-client-toolkit", version = "=0.19.2" }
