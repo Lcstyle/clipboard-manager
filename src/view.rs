@@ -1,5 +1,7 @@
 use std::{borrow::Cow, cmp::min, sync::LazyLock};
 
+use std::collections::HashMap;
+
 use cosmic::{
     Apply, Element,
     iced::{Alignment, Length, alignment::Horizontal, padding},
@@ -11,8 +13,8 @@ use cosmic::{
     widget::{
         self, Id,
         button::{self},
-        column, container, horizontal_space, image, markdown, row, scrollable, text, text_input,
-        toggler, vertical_space,
+        column, container, context_menu, horizontal_space, image, markdown, menu, row, scrollable,
+        text, text_input, toggler, vertical_space,
     },
 };
 use itertools::Itertools;
@@ -22,7 +24,6 @@ use crate::{
     db::{Content, DbTrait, EntryTrait, MimeDataMap},
     fl, icon, icon_button,
     message::{AppMsg, ConfigMsg, ContextMenuMsg},
-    my_widget,
     utils::formatted_value,
 };
 use cosmic::widget::text::heading;
@@ -663,49 +664,50 @@ impl<Db: DbTrait> AppState<Db> {
         let entry_id = entry.id();
         let is_fav = entry.is_favorite();
 
-        // Context menu overlay (right-click menu)
-        let mut overlay_col = column().padding(3);
+        // Context menu items (right-click menu via libcosmic xdg_popup)
+        let mut items = Vec::new();
 
         if is_fav {
-            overlay_col = overlay_col.push(
-                button::text(fl!("remove_favorite"))
-                    .on_press(ContextMenuMsg::RemoveFavorite(entry_id)),
-            );
-            overlay_col = overlay_col.push(
-                button::text(fl!("rename-favorite"))
-                    .on_press(ContextMenuMsg::AddFavorite(entry_id)),
-            );
+            items.push(menu::Item::Button(
+                fl!("remove_favorite"),
+                None,
+                ContextMenuMsg::RemoveFavorite(entry_id),
+            ));
+            items.push(menu::Item::Button(
+                fl!("rename-favorite"),
+                None,
+                ContextMenuMsg::AddFavorite(entry_id),
+            ));
         } else {
-            overlay_col = overlay_col.push(
-                button::text(fl!("add_favorite"))
-                    .on_press(ContextMenuMsg::AddFavorite(entry_id)),
-            );
+            items.push(menu::Item::Button(
+                fl!("add_favorite"),
+                None,
+                ContextMenuMsg::AddFavorite(entry_id),
+            ));
         }
 
         if has_text {
-            overlay_col = overlay_col.push(
-                button::text(fl!("edit-entry")).on_press(ContextMenuMsg::Edit(entry_id)),
-            );
+            items.push(menu::Item::Button(
+                fl!("edit-entry"),
+                None,
+                ContextMenuMsg::Edit(entry_id),
+            ));
         }
 
-        let overlay: Element<_> = overlay_col
-            .push(
-                button::text(fl!("show_qr_code"))
-                    .on_press(ContextMenuMsg::ShowQrCode(entry_id)),
-            )
-            .push(
-                button::text(fl!("delete_entry"))
-                    .on_press(ContextMenuMsg::Delete(entry_id))
-                    .class(Button::Destructive),
-            )
-            .apply(Element::from)
-            .map(AppMsg::ContextMenu);
+        items.push(menu::Item::Button(
+            fl!("show_qr_code"),
+            None,
+            ContextMenuMsg::ShowQrCode(entry_id),
+        ));
+        items.push(menu::Item::Divider);
+        items.push(menu::Item::Button(
+            fl!("delete_entry"),
+            None,
+            ContextMenuMsg::Delete(entry_id),
+        ));
 
-        let overlay = container(overlay)
-            .class(cosmic::theme::Container::Card)
-            .padding(padding::all(5));
-
-        let entry_widget: Element<_> = my_widget::context_menu(content, overlay).into();
+        let tree = menu::items(&HashMap::new(), items);
+        let entry_widget: Element<_> = context_menu(content, Some(tree)).into();
 
         // If we're in the favoriting/rename flow for THIS entry, show the title
         // input card directly below the entry (not inside the context menu)
@@ -768,36 +770,3 @@ impl<Db: DbTrait> AppState<Db> {
         }
     }
 }
-
-/*
-let items = vec![
-            if entry.is_favorite() {
-                menu::Item::Button(
-                    fl!("remove_favorite"),
-                    None,
-                    ContextMenuMsg::RemoveFavorite(entry.id()),
-                )
-            } else {
-                menu::Item::Button(
-                    fl!("add_favorite"),
-                    None,
-                    ContextMenuMsg::AddFavorite(entry.id()),
-                )
-            },
-            menu::Item::Button(
-                fl!("show_qr_code"),
-                None,
-                ContextMenuMsg::ShowQrCode(entry.id()),
-            ),
-            menu::Item::Button(
-                fl!("delete_entry"),
-                None,
-                ContextMenuMsg::Delete(entry.id()),
-            ),
-        ];
-
-        let tree = menu::items(&HashMap::new(), items);
-
-        context_menu(content, Some(tree)).into()
-
-*/

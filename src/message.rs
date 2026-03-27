@@ -68,6 +68,11 @@ pub enum AppMsg {
         position: cosmic::iced_core::Point,
         target: crate::app::PopupKind,
     },
+    /// Raw cursor position from event subscription — used to capture position
+    /// on the fullscreen overlay without requiring physical mouse movement.
+    RawCursorMoved(cosmic::iced_core::Point),
+    /// No-op message used for fire-and-forget async tasks.
+    Noop,
     /// Logical screen size from a wayland output event, used to clamp popup position.
     OutputSize(f32, f32),
     /// No longer used — kept to avoid breaking handler match.

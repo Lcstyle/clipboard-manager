@@ -21,7 +21,6 @@ mod icon;
 mod ipc;
 mod localize;
 mod message;
-mod my_widget;
 mod navigation;
 mod selection_buffer;
 mod utils;

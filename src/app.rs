@@ -282,19 +282,19 @@ impl<Db: DbTrait> AppState<Db> {
 
         let use_layer_surface = force_layer_surface || self.config.horizontal;
 
-        // For D-Bus triggered popups (force_layer_surface), use a two-phase
-        // approach: first create a fullscreen transparent overlay to capture
-        // the cursor position, then render the popup at that position within
-        // the same surface. This works around cosmic-comp not sending configure
-        // events for partially-anchored layer surfaces.
+        // For D-Bus triggered popups (force_layer_surface), create a fullscreen
+        // transparent overlay to capture the cursor position, then render the
+        // popup at that position within the same surface.
+        //
+        // NOTE: cosmic-comp doesn't send wl_pointer.enter when a layer surface
+        // is created under the stationary cursor, so the first physical mouse
+        // movement is required to capture the position.
         if use_layer_surface && matches!(kind, PopupKind::Popup | PopupKind::Favorites | PopupKind::Selections) {
             let overlay_id = Id::unique();
             self.cursor_capture = Some(CursorCapture {
                 overlay_id,
                 target_popup: kind,
             });
-            // Suppress Unfocused events — the applet icon surface loses focus
-            // when the overlay grabs exclusive keyboard.
             self.suppress_unfocus = true;
 
             return get_layer_surface(SctkLayerSurfaceSettings {
@@ -307,7 +307,6 @@ impl<Db: DbTrait> AppState<Db> {
                     | layer_surface::Anchor::RIGHT,
                 namespace: "clipboard manager".into(),
                 size: None,
-                // Large min size prevents iced autosize from shrinking the surface
                 size_limits: Limits::NONE.min_width(10000.0).min_height(10000.0),
                 ..Default::default()
             });
@@ -643,16 +642,15 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
         }
 
         match message {
+            AppMsg::Noop => {}
             AppMsg::DbusToggle => {
                 self.last_quit = None;
                 return self.toggle_popup_ext(PopupKind::Popup, true);
             }
+            AppMsg::RawCursorMoved(_) | AppMsg::Noop => {}
             AppMsg::CursorCaptured { position, target } => {
                 if let Some(capture) = self.cursor_capture.take() {
-                    // Transition the same fullscreen overlay from capture mode
-                    // to popup mode. No destroy/create — just change what
-                    // view_window renders. This avoids the cosmic-comp bug where
-                    // partially-anchored layer surfaces never get configure events.
+                    // Fallback: MouseArea on_move transitions the overlay
                     self.popup = Some(Popup {
                         kind: target,
                         id: capture.overlay_id,
