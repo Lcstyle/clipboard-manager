@@ -21,7 +21,7 @@ use itertools::Itertools;
 
 use crate::{
     app::{AppState, ClipboardState, ErrorState},
-    db::{Content, DbTrait, EntryTrait, MimeDataMap},
+    db::{Content, DbTrait, EntryTrait, MimeDataMap, MimeType},
     fl, icon, icon_button,
     message::{AppMsg, ConfigMsg, ContextMenuMsg},
     utils::formatted_value,
@@ -157,11 +157,10 @@ impl<Db: DbTrait> AppState<Db> {
 
     pub fn selections_view(&self) -> Element<'_, AppMsg> {
         container({
-            let entries_iter: Box<dyn Iterator<Item = &_>> =
-                if self.selection_buffer.is_search_active() {
-                    Box::new(self.selection_buffer.search_iter())
+            let entries_iter = if self.selection_buffer.is_search_active() {
+                    itertools::Either::Left(self.selection_buffer.search_iter())
                 } else {
-                    Box::new(self.selection_buffer.iter())
+                    itertools::Either::Right(self.selection_buffer.iter())
                 };
 
             let now = chrono::Utc::now();
@@ -351,17 +350,18 @@ impl<Db: DbTrait> AppState<Db> {
                     let range = self.page * maximum_entries_by_page
                         ..(self.page + 1) * maximum_entries_by_page;
 
-                    let entries_iter: Box<dyn Iterator<Item = &_>> =
-                        if self.db.is_search_active() {
-                            Box::new(self.db.search_iter())
+                    let entries_iter = if self.db.is_search_active() {
+                            itertools::Either::Left(self.db.search_iter())
                         } else if self.show_favorites_only {
-                            Box::new(
+                            itertools::Either::Right(itertools::Either::Left(
                                 self.db
                                     .chronological_iter()
                                     .filter(|e| e.is_favorite()),
-                            )
+                            ))
                         } else {
-                            Box::new(self.db.chronological_iter())
+                            itertools::Either::Right(itertools::Either::Right(
+                                self.db.chronological_iter(),
+                            ))
                         };
 
                     let entries_view: Vec<_> = entries_iter
@@ -476,7 +476,7 @@ impl<Db: DbTrait> AppState<Db> {
                 .apply(Element::from);
 
                 let mut copy = MimeDataMap::new();
-                copy.insert("text/plain".to_string(), COMMAND.as_bytes().to_vec());
+                copy.insert(MimeType::new("text/plain".to_string()), COMMAND.as_bytes().to_vec());
 
                 column()
                     .push(e)
@@ -718,7 +718,7 @@ impl<Db: DbTrait> AppState<Db> {
 
         if is_favoriting_this {
             let state = self.favoriting_state.as_ref().unwrap();
-            let title_card: Element<_> = if state.suggesting {
+            let title_card: Element<_> = if state.phase == crate::app::FavoritingPhase::Suggesting {
                 container(text(fl!("suggest-title")))
                     .padding(padding::all(8))
                     .class(cosmic::theme::Container::Card)

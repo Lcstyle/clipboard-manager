@@ -201,6 +201,7 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
     }
 }
 
+#[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Couldn't connect to the Wayland compositor")]

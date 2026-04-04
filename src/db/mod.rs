@@ -17,10 +17,65 @@ fn now() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-pub type EntryId = i64;
-pub type Mime = String;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntryId(pub(crate) i64);
+
+impl EntryId {
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for EntryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for EntryId {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let inner = <i64 as sqlx::Decode<sqlx::Sqlite>>::decode(value)?;
+        Ok(EntryId(inner))
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for EntryId {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <i64 as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for EntryId {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <i64 as sqlx::Encode<sqlx::Sqlite>>::encode_by_ref(&self.0, buf)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MimeType(pub(crate) String);
+
+impl MimeType {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MimeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 pub type RawContent = Vec<u8>;
-pub type MimeDataMap = HashMap<Mime, RawContent>;
+pub type MimeDataMap = HashMap<MimeType, RawContent>;
 
 pub enum Content<'a> {
     Text(&'a str),
@@ -103,37 +158,44 @@ pub trait EntryTrait: Debug + Clone + Send {
     ) -> Option<((&str, &RawContent), Content<'_>)> {
         for pref_mime_regex in preferred_mime_types {
             for (mime, raw_content) in self.raw_content() {
-                if !raw_content.is_empty() && pref_mime_regex.is_match(mime) {
-                    match Content::try_new(mime, raw_content) {
-                        Ok(Some(content)) => return Some(((mime, raw_content), content)),
+                if !raw_content.is_empty() && pref_mime_regex.is_match(mime.as_str()) {
+                    match Content::try_new(mime.as_str(), raw_content) {
+                        Ok(Some(content)) => return Some(((mime.as_str(), raw_content), content)),
                         Ok(None) => {
                             // unsupported mime type
                         }
-                        Err(_e) => {}
+                        Err(_e) => {
+                            tracing::debug!("failed to parse content: {_e}");
+                        }
                     }
                 }
             }
         }
 
         for pref_mime in PRIV_MIME_TYPES_SIMPLE {
-            if let Some(raw_content) = self.raw_content().get(*pref_mime)
+            let key = MimeType::new(pref_mime.to_string());
+            if let Some(raw_content) = self.raw_content().get(&key)
                 && !raw_content.is_empty()
             {
                 match Content::try_new(pref_mime, raw_content) {
                     Ok(Some(content)) => return Some(((pref_mime, raw_content), content)),
                     Ok(None) => {}
-                    Err(_e) => {}
+                    Err(_e) => {
+                        tracing::debug!("failed to parse content: {_e}");
+                    }
                 }
             }
         }
 
         for pref_mime_regex in PRIV_MIME_TYPES_REGEX.iter() {
             for (mime, raw_content) in self.raw_content() {
-                if !raw_content.is_empty() && pref_mime_regex.is_match(mime) {
-                    match Content::try_new(mime, raw_content) {
-                        Ok(Some(content)) => return Some(((mime, raw_content), content)),
+                if !raw_content.is_empty() && pref_mime_regex.is_match(mime.as_str()) {
+                    match Content::try_new(mime.as_str(), raw_content) {
+                        Ok(Some(content)) => return Some(((mime.as_str(), raw_content), content)),
                         Ok(None) => {}
-                        Err(_e) => {}
+                        Err(_e) => {
+                            tracing::debug!("failed to parse content: {_e}");
+                        }
                     }
                 }
             }
@@ -144,10 +206,10 @@ pub trait EntryTrait: Debug + Clone + Send {
 
     fn searchable_content(&self) -> impl Iterator<Item = &str> {
         self.raw_content().iter().filter_map(|(mime, content)| {
-            if mime.starts_with("text/") {
+            if mime.as_str().starts_with("text/") {
                 let text = core::str::from_utf8(content).ok()?;
 
-                if mime == "text/html"
+                if mime.as_str() == "text/html"
                     && let Some(alt) = find_alt(text)
                 {
                     return Some(alt);
@@ -174,6 +236,22 @@ pub trait DbTrait: Sized {
 
     async fn insert_with_time(&mut self, data: MimeDataMap, time: i64) -> Result<()>;
 
+    /// Update in-memory state for an insert (dedup, eviction) without touching
+    /// SQLite.  Returns `None` when the DB lock is not held (no-op) or a
+    /// [`DbPersistOp`] that must be executed on a background connection to keep
+    /// the on-disk state in sync.
+    fn insert_to_memory(&mut self, data: MimeDataMap) -> Option<DbPersistOp>;
+
+    /// Delete an entry from in-memory state only, returning the persist op.
+    fn delete_from_memory(&mut self, id: EntryId) -> Option<DbPersistOp>;
+
+    /// Clear non-favorite entries from in-memory state only, returning the persist op.
+    fn clear_memory(&mut self) -> Option<DbPersistOp>;
+
+    /// Path to the SQLite database file (for opening background connections).
+    fn db_path(&self) -> &str;
+
+    #[must_use = "returns the (possibly different) EntryId after dedup"]
     async fn update_content(&mut self, id: EntryId, data: MimeDataMap) -> Result<EntryId>;
 
     async fn delete(&mut self, data: EntryId) -> Result<()>;
@@ -218,10 +296,99 @@ pub trait DbTrait: Sized {
     }
 }
 
+/// Represents a SQL operation to be persisted in the background.
+/// The in-memory state is updated synchronously; these ops capture
+/// the corresponding SQL writes to be executed on a separate connection.
+#[derive(Clone, Debug)]
+pub enum DbPersistOp {
+    /// Duplicate entry detected — just bump its timestamp.
+    UpdateTimestamp {
+        id: EntryId,
+        new_time: i64,
+    },
+    /// Brand new entry — insert rows and optionally evict old entries.
+    InsertNew {
+        id: EntryId,
+        time: i64,
+        data: MimeDataMap,
+        evictions: Vec<EntryId>,
+    },
+    /// Delete an entry.
+    Delete {
+        id: EntryId,
+    },
+    /// Clear all non-favorite entries.
+    ClearNonFavorites,
+}
+
 #[derive(Clone, Debug)]
 pub enum DbMessage {
     CheckUpdate,
 }
+/// Execute a [`DbPersistOp`] on a freshly opened SQLite connection.
+/// This runs on a background thread so the UI stays responsive.
+pub async fn persist_op(db_path: &str, op: DbPersistOp) -> Result<()> {
+    use sqlx::SqliteConnection;
+    use sqlx::prelude::*;
+
+    let mut conn = SqliteConnection::connect(db_path).await?;
+
+    match op {
+        DbPersistOp::UpdateTimestamp { id, new_time } => {
+            sqlx::query("UPDATE ClipboardEntries SET creation = $1 WHERE id = $2")
+                .bind(new_time)
+                .bind(id)
+                .execute(&mut conn)
+                .await?;
+        }
+        DbPersistOp::InsertNew {
+            id,
+            time,
+            data,
+            evictions,
+        } => {
+            sqlx::query("INSERT INTO ClipboardEntries (id, creation) SELECT $1, $2")
+                .bind(id)
+                .bind(time)
+                .execute(&mut conn)
+                .await?;
+
+            for (mime, content) in &data {
+                sqlx::query(
+                    "INSERT INTO ClipboardContents (id, mime, content) SELECT $1, $2, $3",
+                )
+                .bind(id)
+                .bind(mime.as_str())
+                .bind(content)
+                .execute(&mut conn)
+                .await?;
+            }
+
+            for evict_id in evictions {
+                sqlx::query("DELETE FROM ClipboardEntries WHERE id = ?")
+                    .bind(evict_id)
+                    .execute(&mut conn)
+                    .await?;
+            }
+        }
+        DbPersistOp::Delete { id } => {
+            sqlx::query("DELETE FROM ClipboardEntries WHERE id = ?")
+                .bind(id)
+                .execute(&mut conn)
+                .await?;
+        }
+        DbPersistOp::ClearNonFavorites => {
+            sqlx::query(
+                "DELETE FROM ClipboardEntries WHERE id NOT IN (SELECT id FROM FavoriteClipboardEntries)",
+            )
+            .execute(&mut conn)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 // currently best effort
 fn find_alt(html: &str) -> Option<&str> {
     let alt = html.split_once("alt=\"")?.1.split_once('"')?.0;

@@ -25,7 +25,7 @@ use regex::Regex;
 
 use crate::clipboard::ClipboardError;
 use crate::config::{Config, PRIVATE_MODE, SELECTION_BUFFER_ENABLED, SKIP_NEXT_CLIPBOARD};
-use crate::db::{Content, DbMessage, DbTrait, EntryId, EntryTrait, MimeDataMap};
+use crate::db::{Content, DbMessage, DbTrait, EntryId, EntryTrait, MimeDataMap, MimeType, persist_op};
 use crate::editor_ipc::{self, EditorToApp};
 use crate::message::{AppMsg, ConfigMsg, ContextMenuMsg, FavoriteSummary};
 use crate::navigation::EventMsg;
@@ -53,6 +53,38 @@ const PASSWORD_MANAGER_HINT_MIME: &str = "x-kde-passwordManagerHint";
 
 static EDITOR_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Spawn a background task to persist a DB operation to SQLite.
+/// The in-memory state has already been updated; this just writes to disk.
+fn spawn_db_persist(db_path: &str, op: crate::db::DbPersistOp) -> Task<AppMsg> {
+    let db_path = db_path.to_string();
+    Task::perform(
+        async move {
+            persist_op(&db_path, op)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        |result| cosmic::action::app(AppMsg::DbPersistComplete(result)),
+    )
+}
+
+/// Spawn `wl-copy --type <mime>` and pipe `data` into its stdin.
+fn wl_copy(mime: &str, data: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("wl-copy")
+        .arg("--type")
+        .arg(mime)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(data)?;
+    }
+    child.wait()?;
+    Ok(())
+}
+
 /// Tracks the editor subprocess spawned by the applet.
 pub struct EditorProcess {
     pub entry_id: EntryId,
@@ -61,6 +93,13 @@ pub struct EditorProcess {
     pub child: std::process::Child,
     pub stdout_rx: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<EditorToApp>>>>,
     pub session_id: u64,
+}
+
+impl Drop for EditorProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub struct AppState<Db: DbTrait> {
@@ -145,12 +184,21 @@ struct CursorCapture {
     target_popup: PopupKind,
 }
 
+/// Phase of the inline "add favorite" title input flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FavoritingPhase {
+    /// Waiting for an AI title suggestion.
+    Suggesting,
+    /// User is editing the title text.
+    Editing,
+}
+
 /// State for the inline "add favorite" title input flow.
 #[derive(Debug, Clone)]
 pub struct FavoritingState {
     pub entry_id: EntryId,
     pub title_input: String,
-    pub suggesting: bool,
+    pub phase: FavoritingPhase,
 }
 
 impl<Db: DbTrait> AppState<Db> {
@@ -401,7 +449,7 @@ impl<Db: DbTrait> AppState<Db> {
         text: &str,
         mime: String,
     ) -> Task<AppMsg> {
-        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        use std::os::unix::io::{AsRawFd, IntoRawFd};
         use std::os::unix::process::CommandExt;
         use nix::unistd::{close, dup2, pipe};
 
@@ -433,10 +481,11 @@ impl<Db: DbTrait> AppState<Db> {
             }
         };
 
-        // Extract raw fd values for use in pre_exec and manual management.
-        // into_raw_fd() transfers ownership — we manage lifetimes manually from here.
-        let ipc_read_raw = ipc_read_owned.into_raw_fd();
-        let ipc_write_raw = ipc_write_owned.into_raw_fd();
+        // Extract raw fd values for the pre_exec closure (runs post-fork in the child,
+        // so we pass plain integers — OwnedFds must not be moved into pre_exec because
+        // they would be dropped in the child while the parent still owns them).
+        let ipc_read_raw = ipc_read_owned.as_raw_fd();
+        let ipc_write_raw = ipc_write_owned.as_raw_fd();
 
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("--editor-window")
@@ -445,7 +494,12 @@ impl<Db: DbTrait> AppState<Db> {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
 
-        // In the child (pre-fork), place the IPC write end at FD 3.
+        // SAFETY: pre_exec runs between fork() and exec() in the child process.
+        // The closure only calls async-signal-safe functions (dup2, close) and
+        // only touches file descriptors that are valid at this point:
+        //   - ipc_write_raw: write end of the pipe, duplicated to IPC_FD then closed
+        //   - ipc_read_raw: read end of the pipe, closed (only parent needs it)
+        // The raw fd values are Copy integers captured by value — no ownership issues.
         unsafe {
             cmd.pre_exec(move || {
                 // Move write end to the well-known IPC_FD
@@ -465,18 +519,19 @@ impl<Db: DbTrait> AppState<Db> {
             Ok(child) => child,
             Err(e) => {
                 error!("failed to spawn editor: {e}");
-                // Clean up pipe fds on failure
-                close(ipc_read_raw).ok();
-                close(ipc_write_raw).ok();
+                // OwnedFds drop here and close automatically on failure
+                drop(ipc_read_owned);
+                drop(ipc_write_owned);
                 return Task::none();
             }
         };
 
-        // Parent: close the write end (only the child writes)
-        close(ipc_write_raw).ok();
+        // Parent: close the write end (only the child writes).
+        // into_raw_fd() relinquishes ownership so close() is the manual cleanup.
+        close(ipc_write_owned.into_raw_fd()).ok();
 
-        // Wrap the read end as a File for the reader thread
-        let ipc_read_file = unsafe { std::fs::File::from_raw_fd(ipc_read_raw) };
+        // Convert the read end to a File via OwnedFd (safe ownership transfer).
+        let ipc_read_file = std::fs::File::from(ipc_read_owned);
 
         let mut stdin_handle = child.stdin.take().unwrap();
 
@@ -487,7 +542,7 @@ impl<Db: DbTrait> AppState<Db> {
         if let Err(e) = editor_ipc::write_frame(
             &mut stdin_handle,
             &editor_ipc::AppToEditor::Init {
-                entry_id,
+                entry_id: entry_id.as_i64(),
                 mime: mime.clone(),
                 content: text.to_string(),
                 is_favorite,
@@ -643,6 +698,11 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
 
         match message {
             AppMsg::Noop => {}
+            AppMsg::DbPersistComplete(result) => {
+                if let Err(e) = result {
+                    error!("background DB persist failed: {e}");
+                }
+            }
             AppMsg::DbusToggle => {
                 self.last_quit = None;
                 return self.toggle_popup_ext(PopupKind::Popup, true);
@@ -686,15 +746,13 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                             None => "[unknown]".to_string(),
                         };
                         EntrySummary {
-                            id: entry.id(),
+                            id: entry.id().as_i64(),
                             is_favorite: entry.is_favorite(),
                             preview,
                         }
                     })
                     .collect();
-                if let Some(tx) = reply.lock().unwrap().take() {
-                    let _ = tx.send(summaries);
-                }
+                reply.reply(summaries);
             }
             AppMsg::DbusCopyEntry { id, reply } => {
                 match self.db.get_from_id(id) {
@@ -703,44 +761,26 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                         // because the applet may not have Wayland focus when called via D-Bus.
                         let raw = entry.raw_content();
                         // Prefer text/plain, fall back to first available MIME type
-                        let (mime, data) = if let Some(d) = raw.get("text/plain") {
+                        let (mime, data) = if let Some(d) = raw.get(&MimeType::new("text/plain".to_string())) {
                             ("text/plain".to_string(), d.clone())
                         } else if let Some((m, d)) = raw.iter().next() {
-                            (m.clone(), d.clone())
+                            (m.as_str().to_string(), d.clone())
                         } else {
-                            if let Some(tx) = reply.lock().unwrap().take() {
-                                let _ = tx.send(Err("entry has no content".to_string()));
-                            }
+                            reply.reply(Err("entry has no content".to_string()));
                             return Task::none();
                         };
-                        match std::process::Command::new("wl-copy")
-                            .arg("--type")
-                            .arg(&mime)
-                            .stdin(std::process::Stdio::piped())
-                            .spawn()
-                        {
-                            Ok(mut child) => {
-                                if let Some(mut stdin) = child.stdin.take() {
-                                    use std::io::Write;
-                                    let _ = stdin.write_all(&data);
-                                }
-                                let _ = child.wait();
-                                if let Some(tx) = reply.lock().unwrap().take() {
-                                    let _ = tx.send(Ok(()));
-                                }
+                        match wl_copy(&mime, &data) {
+                            Ok(()) => {
+                                reply.reply(Ok(()));
                             }
                             Err(e) => {
                                 error!("wl-copy failed: {e}");
-                                if let Some(tx) = reply.lock().unwrap().take() {
-                                    let _ = tx.send(Err(format!("wl-copy failed: {e}")));
-                                }
+                                reply.reply(Err(format!("wl-copy failed: {e}")));
                             }
                         }
                     }
                     None => {
-                        if let Some(tx) = reply.lock().unwrap().take() {
-                            let _ = tx.send(Err(format!("entry {id} not found")));
-                        }
+                        reply.reply(Err(format!("entry {id} not found")));
                     }
                 };
             }
@@ -756,9 +796,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     }
                     None => Err(format!("entry {id} not found")),
                 };
-                if let Some(tx) = reply.lock().unwrap().take() {
-                    let _ = tx.send(result);
-                }
+                reply.reply(result);
             }
             AppMsg::ChangeConfig(config) => {
                 if config.private_mode != self.config.private_mode {
@@ -811,16 +849,18 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                         atomic::Ordering::Relaxed,
                     ).is_ok() {
                         info!("skipping DB insert for primary selection sync");
-                    } else if data.contains_key(PASSWORD_MANAGER_HINT_MIME) {
+                    } else if data.contains_key(&MimeType::new(PASSWORD_MANAGER_HINT_MIME.to_string())) {
                         info!("clipboard contains password manager hint, skipping storage");
                         self.last_entry_sensitive = true;
                     } else {
                         self.last_entry_sensitive = false;
-                        if let Err(e) = block_on(self.db.insert(data)) {
-                            error!("can't insert data: {e}");
+                        // Update in-memory state synchronously (instant), persist to
+                        // SQLite in the background so the UI thread never blocks on I/O.
+                        if let Some(op) = self.db.insert_to_memory(data) {
+                            // Track the newest entry as the current clipboard buffer
+                            self.current_entry_id = self.db.chronological_iter().next().map(|e| e.id());
+                            return spawn_db_persist(self.db.db_path(), op);
                         }
-                        // Track the newest entry as the current clipboard buffer
-                        self.current_entry_id = self.db.chronological_iter().next().map(|e| e.id());
                     }
                 }
                 #[expect(irrefutable_let_patterns)]
@@ -850,7 +890,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     info!("primary clipboard watcher connected");
                 }
                 clipboard::ClipboardMessage::Data(data) => {
-                    if let Some(text_data) = data.get("text/plain") {
+                    if let Some(text_data) = data.get(&MimeType::new("text/plain".to_string())) {
                         if let Ok(text) = String::from_utf8(text_data.clone()) {
                             if self.config.selection_buffer_enabled {
                                 // Always insert into the in-memory selection buffer
@@ -861,45 +901,17 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                                     SKIP_NEXT_CLIPBOARD.store(true, atomic::Ordering::Release);
 
                                     // Copy to clipboard via wl-copy for immediate Ctrl+V
-                                    match std::process::Command::new("wl-copy")
-                                        .arg("--type")
-                                        .arg("text/plain")
-                                        .stdin(std::process::Stdio::piped())
-                                        .spawn()
-                                    {
-                                        Ok(mut child) => {
-                                            if let Some(mut stdin) = child.stdin.take() {
-                                                use std::io::Write;
-                                                let _ = stdin.write_all(text_data);
-                                            }
-                                            let _ = child.wait();
-                                        }
-                                        Err(e) => {
-                                            // Clear skip flag on failure
-                                            SKIP_NEXT_CLIPBOARD.store(false, atomic::Ordering::Release);
-                                            error!("primary sync: wl-copy failed: {e}");
-                                        }
+                                    if let Err(e) = wl_copy("text/plain", text_data) {
+                                        // Clear skip flag on failure
+                                        SKIP_NEXT_CLIPBOARD.store(false, atomic::Ordering::Release);
+                                        error!("primary sync: wl-copy failed: {e}");
                                     }
                                 }
                                 // If sync_clipboard is false, text only goes to buffer (no wl-copy)
                             } else {
                                 // Selection buffer disabled — old behavior: just wl-copy to clipboard
-                                match std::process::Command::new("wl-copy")
-                                    .arg("--type")
-                                    .arg("text/plain")
-                                    .stdin(std::process::Stdio::piped())
-                                    .spawn()
-                                {
-                                    Ok(mut child) => {
-                                        if let Some(mut stdin) = child.stdin.take() {
-                                            use std::io::Write;
-                                            let _ = stdin.write_all(text_data);
-                                        }
-                                        let _ = child.wait();
-                                    }
-                                    Err(e) => {
-                                        error!("primary sync: wl-copy failed: {e}");
-                                    }
+                                if let Err(e) = wl_copy("text/plain", text_data) {
+                                    error!("primary sync: wl-copy failed: {e}");
                                 }
                             }
                         }
@@ -929,8 +941,8 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 return copy_iced(data);
             }
             AppMsg::Clear => {
-                if let Err(e) = block_on(self.db.clear()) {
-                    error!("can't clear db: {e}");
+                if let Some(op) = self.db.clear_memory() {
+                    return spawn_db_persist(self.db.db_path(), op);
                 }
             }
             AppMsg::RetryConnectingClipboard => {
@@ -1052,7 +1064,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                             self.favoriting_state = Some(FavoritingState {
                                 entry_id: entry,
                                 title_input: existing_title,
-                                suggesting: false,
+                                phase: FavoritingPhase::Editing,
                             });
                             // Don't auto-suggest for rename — user already has a title
                             let _ = content_for_ai;
@@ -1111,8 +1123,8 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     {
                         self.send_to_editor(&editor_ipc::AppToEditor::EntryDeleted);
                     }
-                    if let Err(e) = block_on(self.db.delete(id)) {
-                        error!("can't delete {}: {}", id, e);
+                    if let Some(op) = self.db.delete_from_memory(id) {
+                        return spawn_db_persist(self.db.db_path(), op);
                     }
                 }
             },
@@ -1158,19 +1170,17 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                             if let Some(editor) = &self.editor {
                                 let entry_id = editor.entry_id;
                                 eprintln!("[applet] SaveAsNew: empty content, deleting entry {entry_id}");
-                                if let Err(e) = block_on(self.db.delete(entry_id)) {
-                                    error!("failed to delete entry: {e}");
+                                if let Some(op) = self.db.delete_from_memory(entry_id) {
+                                    return spawn_db_persist(self.db.db_path(), op);
                                 }
                             }
                         } else {
                             let mut data = MimeDataMap::new();
-                            data.insert("text/plain".to_string(), content.as_bytes().to_vec());
-                            match block_on(self.db.insert(data.clone())) {
-                                Ok(()) => {
-                                    eprintln!("[applet] SaveAsNew: inserted as new entry");
-                                    return copy_iced(data);
-                                }
-                                Err(e) => error!("failed to save as new entry: {e}"),
+                            data.insert(MimeType::new("text/plain".to_string()), content.as_bytes().to_vec());
+                            if let Some(op) = self.db.insert_to_memory(data.clone()) {
+                                eprintln!("[applet] SaveAsNew: inserted as new entry");
+                                let persist = spawn_db_persist(self.db.db_path(), op);
+                                return Task::batch([copy_iced(data), persist]);
                             }
                         }
                     }
@@ -1181,12 +1191,12 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                             if content.trim().is_empty() {
                                 // Empty content — delete the entry
                                 eprintln!("[applet] UpdateExisting: empty content, deleting entry {entry_id}");
-                                if let Err(e) = block_on(self.db.delete(entry_id)) {
-                                    error!("failed to delete entry: {e}");
+                                if let Some(op) = self.db.delete_from_memory(entry_id) {
+                                    return spawn_db_persist(self.db.db_path(), op);
                                 }
                             } else {
                                 let mut data = MimeDataMap::new();
-                                data.insert("text/plain".to_string(), content.as_bytes().to_vec());
+                                data.insert(MimeType::new("text/plain".to_string()), content.as_bytes().to_vec());
                                 match block_on(self.db.update_content(entry_id, data.clone())) {
                                     Ok(_new_id) => {
                                         eprintln!("[applet] UpdateExisting: updated entry {entry_id}");
@@ -1222,22 +1232,8 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             AppMsg::SelectionCopy(id) => {
                 if let Some(entry) = self.selection_buffer.get_by_id(id) {
                     let text_data = entry.text.as_bytes().to_vec();
-                    match std::process::Command::new("wl-copy")
-                        .arg("--type")
-                        .arg("text/plain")
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()
-                    {
-                        Ok(mut child) => {
-                            if let Some(mut stdin) = child.stdin.take() {
-                                use std::io::Write;
-                                let _ = stdin.write_all(&text_data);
-                            }
-                            let _ = child.wait();
-                        }
-                        Err(e) => {
-                            error!("selection copy: wl-copy failed: {e}");
-                        }
+                    if let Err(e) = wl_copy("text/plain", &text_data) {
+                        error!("selection copy: wl-copy failed: {e}");
                     }
                 }
                 // Do NOT close popup — multi-grab workflow
@@ -1246,20 +1242,16 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 if let Some(entry) = self.selection_buffer.get_by_id(id) {
                     let text = entry.text.clone();
                     let mut data = MimeDataMap::new();
-                    data.insert("text/plain".to_string(), text.as_bytes().to_vec());
-                    match block_on(self.db.insert(data)) {
-                        Ok(()) => {
-                            // Get the newly inserted entry's ID (first in chronological order)
-                            let new_id = self.db.chronological_iter().next().map(|e| e.id());
-                            if let Some(new_id) = new_id {
-                                if let Err(e) = block_on(self.db.add_favorite(new_id, None)) {
-                                    error!("failed to add favorite: {e}");
-                                }
+                    data.insert(MimeType::new("text/plain".to_string()), text.as_bytes().to_vec());
+                    if let Some(op) = self.db.insert_to_memory(data) {
+                        // Get the newly inserted entry's ID (first in chronological order)
+                        let new_id = self.db.chronological_iter().next().map(|e| e.id());
+                        if let Some(new_id) = new_id {
+                            if let Err(e) = block_on(self.db.add_favorite(new_id, None)) {
+                                error!("failed to add favorite: {e}");
                             }
                         }
-                        Err(e) => {
-                            error!("failed to insert selection as entry: {e}");
-                        }
+                        return spawn_db_persist(self.db.db_path(), op);
                     }
                 }
             }
@@ -1285,15 +1277,13 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                             None => "[unknown]".to_string(),
                         };
                         FavoriteSummary {
-                            id: entry.id(),
+                            id: entry.id().as_i64(),
                             title: entry.favorite_title().map(|s| s.to_string()),
                             preview,
                         }
                     })
                     .collect();
-                if let Some(tx) = reply.lock().unwrap().take() {
-                    let _ = tx.send(summaries);
-                }
+                reply.reply(summaries);
             }
             AppMsg::BeginFavorite(id) => {
                 // Get entry content for AI suggestion
@@ -1310,7 +1300,11 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 self.favoriting_state = Some(FavoritingState {
                     entry_id: id,
                     title_input: String::new(),
-                    suggesting: content_for_ai.is_some() && ai::get_api_key().is_some(),
+                    phase: if content_for_ai.is_some() && ai::get_api_key().is_some() {
+                        FavoritingPhase::Suggesting
+                    } else {
+                        FavoritingPhase::Editing
+                    },
                 });
 
                 // Kick off AI suggestion if we have text content and an API key
@@ -1329,7 +1323,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 if let Some(state) = &mut self.favoriting_state {
                     if state.entry_id == id {
                         state.title_input = suggestion.unwrap_or_default();
-                        state.suggesting = false;
+                        state.phase = FavoritingPhase::Editing;
                     }
                 }
             }
@@ -1373,7 +1367,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 });
                 if let Some(text) = content_for_ai {
                     if let Some(state) = &mut self.favoriting_state {
-                        state.suggesting = true;
+                        state.phase = FavoritingPhase::Suggesting;
                     }
                     return Task::perform(
                         async move { ai::suggest_title(&text).await },
@@ -1579,10 +1573,12 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             let _ = editor.child.wait();
         }
 
-        if self.config.unique_session
-            && let Err(err) = block_on(self.db.clear())
-        {
-            error!("{err}");
+        if self.config.unique_session {
+            // On close with unique_session, clear non-favorites synchronously
+            // since we can't return a Task from dbus_activation.
+            if let Err(err) = block_on(self.db.clear()) {
+                error!("{err}");
+            }
         }
         None
     }
@@ -1598,12 +1594,12 @@ fn copy_iced(data: MimeDataMap) -> Task<AppMsg> {
 
     impl AsMimeTypes for MimeDataMapN {
         fn available(&self) -> std::borrow::Cow<'static, [String]> {
-            std::borrow::Cow::Owned(self.0.keys().cloned().collect())
+            std::borrow::Cow::Owned(self.0.keys().map(|k| k.as_str().to_string()).collect())
         }
 
         fn as_bytes(&self, mime_type: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
             self.0
-                .get(mime_type)
+                .get(&MimeType::new(mime_type.to_string()))
                 .map(|d| std::borrow::Cow::Owned(d.clone()))
         }
     }

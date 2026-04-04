@@ -8,6 +8,8 @@ use cosmic::iced::{Length, padding};
 use cosmic::widget::{column, container, row, scrollable, text, text_input};
 use cosmic::Element;
 
+use tokio::time::{timeout, Duration};
+
 use crate::{ai, ipc};
 
 const FAVORITES_APP_ID: &str = "io.github.cosmic_utils.clipboard-favorites";
@@ -595,10 +597,14 @@ impl cosmic::Application for FavoritesApp {
 }
 
 async fn load_favorites_async() -> Vec<(i64, String, String)> {
-    match ipc::send_list_favorites_async().await {
-        Ok(entries) => entries,
-        Err(e) => {
+    match timeout(Duration::from_secs(5), ipc::send_list_favorites_async()).await {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) => {
             eprintln!("[favorites] Failed to load favorites: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            eprintln!("[favorites] Loading favorites timed out after 5s");
             Vec::new()
         }
     }

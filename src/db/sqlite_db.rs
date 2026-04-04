@@ -9,7 +9,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use nucleo::{
     Matcher, Utf32Str,
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
@@ -21,7 +21,7 @@ use crate::{
     utils::{self},
 };
 
-use super::{DbMessage, DbTrait, EntryId, EntryTrait, MimeDataMap, PRIV_MIME_TYPES_SIMPLE, now};
+use super::{DbMessage, DbPersistOp, DbTrait, EntryId, EntryTrait, MimeDataMap, MimeType, PRIV_MIME_TYPES_SIMPLE, now};
 
 type Time = i64;
 
@@ -50,6 +50,8 @@ pub struct DbSqlite {
     pub(super) favorites: Favorites,
     lock: LockFile,
     max_entries: Option<u32>,
+    /// Path to the SQLite database file, stored for background write connections.
+    db_file_path: String,
 }
 
 #[derive(Clone)]
@@ -114,11 +116,16 @@ impl Favorites {
     }
 
     #[allow(dead_code)]
-    fn change(&mut self, prev: &EntryId, new: EntryId) {
-        let pos = self.favorites.iter().position(|e| e == prev).unwrap();
+    fn change(&mut self, prev: &EntryId, new: EntryId) -> Result<()> {
+        let pos = self
+            .favorites
+            .iter()
+            .position(|e| e == prev)
+            .ok_or_else(|| anyhow!("entry not found in favorites"))?;
         self.favorites[pos] = new;
         self.favorites_hash_set.remove(prev);
         self.favorites_hash_set.insert(new);
+        Ok(())
     }
 
     pub(super) fn len(&self) -> usize {
@@ -128,7 +135,8 @@ impl Favorites {
 
 fn hash_entry_content<H: Hasher>(data: &MimeDataMap, state: &mut H) {
     for m in PRIV_MIME_TYPES_SIMPLE {
-        if let Some(content) = data.get(*m)
+        let key = MimeType::new(m.to_string());
+        if let Some(content) = data.get(&key)
             && !content.is_empty()
         {
             content.hash(state);
@@ -137,7 +145,7 @@ fn hash_entry_content<H: Hasher>(data: &MimeDataMap, state: &mut H) {
     }
 
     let mut sorted = data.iter().collect::<Vec<_>>();
-    sorted.sort_by(|(mime1, _), (mime2, _)| mime1.cmp(mime2));
+    sorted.sort_by(|(mime1, _), (mime2, _)| mime1.as_str().cmp(mime2.as_str()));
 
     for (_, content) in sorted {
         content.hash(state);
@@ -200,7 +208,8 @@ impl DbTrait for DbSqlite {
     type Entry = Entry;
 
     async fn new(config: &Config) -> Result<Self> {
-        let directories = directories::ProjectDirs::from(QUALIFIER, ORG, APP).unwrap();
+        let directories = directories::ProjectDirs::from(QUALIFIER, ORG, APP)
+            .context("failed to determine XDG directories")?;
 
         std::fs::create_dir_all(directories.cache_dir())?;
 
@@ -227,7 +236,7 @@ impl DbTrait for DbSqlite {
         std::fs::create_dir_all(&migration_path)?;
         include_dir::include_dir!("migrations")
             .extract(&migration_path)
-            .unwrap();
+            .context("failed to extract embedded migrations")?;
 
         match sqlx::migrate::Migrator::new(migration_path).await {
             Ok(migrator) => migrator,
@@ -260,8 +269,7 @@ impl DbTrait for DbSqlite {
                 .bind(now_millis)
                 .bind(max_millis as i64)
                 .execute(&mut conn)
-                .await
-                .unwrap();
+                .await?;
         }
 
         if lock.owns_lock()
@@ -277,8 +285,7 @@ impl DbTrait for DbSqlite {
             match sqlx::query(query_get_most_older)
                 .bind(max_number_of_entries)
                 .fetch_optional(&mut conn)
-                .await
-                .unwrap()
+                .await?
             {
                 Some(r) => {
                     let creation: Time = r.get("creation");
@@ -294,8 +301,7 @@ impl DbTrait for DbSqlite {
                     sqlx::query(query_delete_old_one)
                         .bind(creation)
                         .execute(&mut conn)
-                        .await
-                        .unwrap();
+                        .await?;
                 }
                 None => {
                     // nothing to do
@@ -316,6 +322,7 @@ impl DbTrait for DbSqlite {
             favorites: Favorites::default(),
             lock,
             max_entries: config.maximum_entries_number,
+            db_file_path: db_path.to_string(),
         };
 
         db.reload().await?;
@@ -407,7 +414,7 @@ impl DbTrait for DbSqlite {
                 let content: Vec<u8> = row.get("content");
 
                 let entry = self.entries.get_mut(&id).expect("entry should exist");
-                entry.raw_content.insert(mime, content);
+                entry.raw_content.insert(MimeType::new(mime), content);
             }
         }
 
@@ -459,7 +466,7 @@ impl DbTrait for DbSqlite {
                 .execute(&mut self.conn)
                 .await?;
         } else {
-            let id = now as EntryId;
+            let id = EntryId(now);
 
             let query_insert_new_entry = r#"
                 INSERT INTO ClipboardEntries (id, creation)
@@ -480,7 +487,7 @@ impl DbTrait for DbSqlite {
 
                 sqlx::query(query_insert_content)
                     .bind(id)
-                    .bind(mime)
+                    .bind(mime.as_str())
                     .bind(content)
                     .execute(&mut self.conn)
                     .await?;
@@ -534,6 +541,116 @@ impl DbTrait for DbSqlite {
         Ok(())
     }
 
+    fn insert_to_memory(&mut self, data: MimeDataMap) -> Option<DbPersistOp> {
+        if !self.lock.owns_lock() {
+            info!("db already locked");
+            return None;
+        }
+
+        let now = now();
+        let hash = get_hash_entry_content(&data);
+
+        if let Some(id) = self.hashs.get(&hash) {
+            let id = *id;
+            let entry = self.entries.get_mut(&id).unwrap();
+            let old_creation = entry.creation;
+            entry.creation = now;
+            let res = self.times.remove(&old_creation);
+            assert!(res.is_some());
+            self.times.insert(now, id);
+
+            self.search();
+            Some(DbPersistOp::UpdateTimestamp { id, new_time: now })
+        } else {
+            let id = EntryId(now);
+
+            let entry = Entry {
+                id,
+                creation: now,
+                raw_content: data.clone(),
+                is_favorite: false,
+                favorite_title: None,
+            };
+
+            self.times.insert(now, id);
+            self.hashs.insert(hash, id);
+            self.entries.insert(id, entry);
+
+            // Evict oldest non-favorite entries if over the max_entries limit
+            let mut evictions = Vec::new();
+            if let Some(max) = self.max_entries {
+                while self.entries.len() > max as usize {
+                    let oldest = self
+                        .times
+                        .iter()
+                        .find(|(_, eid)| !self.favorites.contains(eid))
+                        .map(|(time, eid)| (*time, *eid));
+
+                    match oldest {
+                        Some((time, evict_id)) => {
+                            self.times.remove(&time);
+                            if let Some(evicted) = self.entries.remove(&evict_id) {
+                                self.hashs.remove(&evicted.get_hash());
+                            }
+                            evictions.push(evict_id);
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            self.search();
+            Some(DbPersistOp::InsertNew {
+                id,
+                time: now,
+                data,
+                evictions,
+            })
+        }
+    }
+
+    fn delete_from_memory(&mut self, id: EntryId) -> Option<DbPersistOp> {
+        match self.entries.remove(&id) {
+            Some(entry) => {
+                self.hashs.remove(&entry.get_hash());
+                self.times.remove(&entry.creation);
+                if entry.is_favorite() {
+                    self.favorites.remove(&entry.id);
+                }
+                self.search();
+                Some(DbPersistOp::Delete { id })
+            }
+            None => {
+                warn!("no entry to remove");
+                None
+            }
+        }
+    }
+
+    fn clear_memory(&mut self) -> Option<DbPersistOp> {
+        // Remove all non-favorite entries from in-memory state
+        let to_remove: Vec<EntryId> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|id| !self.favorites.contains(id))
+            .collect();
+
+        for id in to_remove {
+            if let Some(entry) = self.entries.remove(&id) {
+                self.hashs.remove(&entry.get_hash());
+                self.times.remove(&entry.creation);
+            }
+        }
+
+        self.search();
+        Some(DbPersistOp::ClearNonFavorites)
+    }
+
+    fn db_path(&self) -> &str {
+        &self.db_file_path
+    }
+
     async fn update_content(&mut self, id: EntryId, data: MimeDataMap) -> Result<EntryId> {
         let new_hash = get_hash_entry_content(&data);
         let now = now();
@@ -577,7 +694,7 @@ impl DbTrait for DbSqlite {
         for (mime, content) in &data {
             sqlx::query("INSERT INTO ClipboardContents (id, mime, content) SELECT $1, $2, $3")
                 .bind(id)
-                .bind(mime)
+                .bind(mime.as_str())
                 .bind(content)
                 .execute(&mut self.conn)
                 .await?;
@@ -662,8 +779,7 @@ impl DbTrait for DbSqlite {
             sqlx::query(query_bump_positions)
                 .bind(pos as i32)
                 .execute(&mut self.conn)
-                .await
-                .unwrap();
+                .await?;
         }
 
         let index = index.unwrap_or(self.favorites.len() - 1);

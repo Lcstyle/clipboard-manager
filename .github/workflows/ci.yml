@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [master, main]
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -66,3 +68,14 @@ jobs:
 
       - name: Run rustfmt
         run: cargo fmt --all --check --verbose
+
+  audit:
+    name: Security audit
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo-deny
+        run: cargo deny check

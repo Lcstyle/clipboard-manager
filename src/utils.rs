@@ -4,6 +4,7 @@ use std::cmp::min;
 use chrono::Utc;
 use cosmic::{Action, Task};
 
+#[must_use]
 pub fn formatted_value(value: &str, max_lines: usize, max_chars: usize) -> Cow<'_, str> {
     let value = value.trim();
 
@@ -50,6 +51,7 @@ fn split_at(str: &str, n: usize) -> &str {
     }
 }
 
+#[must_use]
 pub fn task_message<M: Send + 'static>(message: M) -> Task<Action<M>> {
     Task::done(cosmic::action::app(message))
 }
@@ -61,6 +63,7 @@ pub fn now_millis() -> i64 {
 /// Produce a single-line preview suitable for CLI output.
 /// Replaces newlines and tabs with spaces, trims whitespace, and truncates
 /// at `max_chars` with `...` if needed.
+#[must_use]
 pub fn sanitize_preview(text: &str, max_chars: usize) -> String {
     let one_line: String = text
         .chars()

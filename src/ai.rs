@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use tokio::time::{timeout, Duration};
 
 static CACHED_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 
@@ -100,14 +101,18 @@ pub async fn suggest_title(content: &str) -> Option<String> {
     ));
     request.add_user(misanthropy::Content::text(truncated));
 
-    match client.messages(&request).await {
-        Ok(response) => {
+    match timeout(Duration::from_secs(15), client.messages(&request)).await {
+        Ok(Ok(response)) => {
             let text = response.format_content();
             let title = sanitize_title(&text);
             if title.is_empty() { None } else { Some(title) }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("AI title suggestion failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("AI title suggestion timed out after 15s");
             None
         }
     }

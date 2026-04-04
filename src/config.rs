@@ -67,7 +67,7 @@ impl Default for Config {
             selection_buffer_enabled: false,
             selection_buffer_sync_clipboard: true,
             selection_buffer_max_entries: 1000,
-            maximum_entries_by_page: NonZero::new(50).unwrap(),
+            maximum_entries_by_page: NonZero::new(50).expect("50 is non-zero"),
             preferred_mime_types: Vec::new(),
         }
     }

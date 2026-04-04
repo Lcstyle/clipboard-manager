@@ -11,7 +11,7 @@ rust-version = "1.88"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = [] }
+tokio = { version = "1", features = ["sync", "time", "rt", "process", "macros"] }
 
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
@@ -60,9 +60,26 @@ tokio = { version = "1", features = ["macros"] }
 # configurator_schema = { git = "https://github.com/cosmic-utils/configurator.git" }
 
 
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+overflow-checks = true
+
 [profile.release-lto]
 inherits = "release"
 lto = "thin"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[lints]
+workspace = true
 
 [patch."https://github.com/pop-os/libcosmic".libcosmic]
 git = "https://github.com/Lcstyle/libcosmic.git"

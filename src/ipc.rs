@@ -6,9 +6,11 @@
 //! on the running service instance, which sends a message through the iced
 //! subscription to the app.
 
-use std::sync::{Arc, Mutex};
+use anyhow::{Context, Result, bail};
+use tokio::time::{timeout, Duration};
 
-use crate::message::{AppMsg, FavoriteSummary};
+use crate::db::EntryId;
+use crate::message::{AppMsg, FavoriteSummary, ReplyHandle};
 use cosmic::iced_futures::Subscription;
 
 const BUS_NAME: &str = "io.github.cosmic_utils.ClipboardManager";
@@ -225,7 +227,7 @@ pub fn dbus_toggle_subscription() -> Subscription<AppMsg> {
                     Some(IpcCommand::ListEntries { reply }) => {
                         output
                             .send(AppMsg::DbusListEntries {
-                                reply: Arc::new(Mutex::new(Some(reply))),
+                                reply: ReplyHandle::new(reply),
                             })
                             .await
                             .ok();
@@ -233,8 +235,8 @@ pub fn dbus_toggle_subscription() -> Subscription<AppMsg> {
                     Some(IpcCommand::CopyEntry { id, reply }) => {
                         output
                             .send(AppMsg::DbusCopyEntry {
-                                id,
-                                reply: Arc::new(Mutex::new(Some(reply))),
+                                id: EntryId(id),
+                                reply: ReplyHandle::new(reply),
                             })
                             .await
                             .ok();
@@ -242,8 +244,8 @@ pub fn dbus_toggle_subscription() -> Subscription<AppMsg> {
                     Some(IpcCommand::GetEntry { id, reply }) => {
                         output
                             .send(AppMsg::DbusGetEntry {
-                                id,
-                                reply: Arc::new(Mutex::new(Some(reply))),
+                                id: EntryId(id),
+                                reply: ReplyHandle::new(reply),
                             })
                             .await
                             .ok();
@@ -251,21 +253,21 @@ pub fn dbus_toggle_subscription() -> Subscription<AppMsg> {
                     Some(IpcCommand::EditEntry { id }) => {
                         output
                             .send(AppMsg::ContextMenu(
-                                crate::message::ContextMenuMsg::Edit(id),
+                                crate::message::ContextMenuMsg::Edit(EntryId(id)),
                             ))
                             .await
                             .ok();
                     }
                     Some(IpcCommand::SetFavoriteTitle { id, title }) => {
                         output
-                            .send(AppMsg::SetFavoriteTitle(id, title))
+                            .send(AppMsg::SetFavoriteTitle(EntryId(id), title))
                             .await
                             .ok();
                     }
                     Some(IpcCommand::RemoveFavorite { id }) => {
                         output
                             .send(AppMsg::ContextMenu(
-                                crate::message::ContextMenuMsg::RemoveFavorite(id),
+                                crate::message::ContextMenuMsg::RemoveFavorite(EntryId(id)),
                             ))
                             .await
                             .ok();
@@ -279,7 +281,7 @@ pub fn dbus_toggle_subscription() -> Subscription<AppMsg> {
                     Some(IpcCommand::ListFavorites { reply }) => {
                         output
                             .send(AppMsg::DbusListFavorites {
-                                reply: Arc::new(Mutex::new(Some(reply))),
+                                reply: ReplyHandle::new(reply),
                             })
                             .await
                             .ok();
@@ -295,7 +297,7 @@ pub fn dbus_toggle_subscription() -> Subscription<AppMsg> {
 }
 
 /// Send a Toggle call to the running applet via D-Bus (blocking, for CLI use).
-pub fn send_toggle() -> Result<(), Box<dyn std::error::Error>> {
+pub fn send_toggle() -> Result<()> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -308,7 +310,7 @@ pub fn send_toggle() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Send an EditLatest call to the running applet via D-Bus (blocking, for CLI use).
-pub fn send_edit_latest() -> Result<(), Box<dyn std::error::Error>> {
+pub fn send_edit_latest() -> Result<()> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -321,7 +323,7 @@ pub fn send_edit_latest() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// List all clipboard entries from the running applet via D-Bus (blocking, for CLI use).
-pub fn send_list_entries() -> Result<Vec<(i64, bool, String)>, Box<dyn std::error::Error>> {
+pub fn send_list_entries() -> Result<Vec<(i64, bool, String)>> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -336,7 +338,7 @@ pub fn send_list_entries() -> Result<Vec<(i64, bool, String)>, Box<dyn std::erro
 
 /// Get raw content of a specific entry by ID via D-Bus (blocking, for CLI use).
 /// Returns Ok((mime, bytes)) on success, Err with message on failure.
-pub fn send_get_entry(id: i64) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+pub fn send_get_entry(id: i64) -> Result<(String, Vec<u8>)> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -349,12 +351,12 @@ pub fn send_get_entry(id: i64) -> Result<(String, Vec<u8>), Box<dyn std::error::
     if error.is_empty() {
         Ok((mime, data))
     } else {
-        Err(error.into())
+        bail!("{error}")
     }
 }
 
 /// Send a ToggleFavorites call to the running applet via D-Bus (blocking, for CLI use).
-pub fn send_toggle_favorites() -> Result<(), Box<dyn std::error::Error>> {
+pub fn send_toggle_favorites() -> Result<()> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -367,7 +369,7 @@ pub fn send_toggle_favorites() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Send a ToggleSelections call to the running applet via D-Bus (blocking, for CLI use).
-pub fn send_toggle_selections() -> Result<(), Box<dyn std::error::Error>> {
+pub fn send_toggle_selections() -> Result<()> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -381,7 +383,7 @@ pub fn send_toggle_selections() -> Result<(), Box<dyn std::error::Error>> {
 
 /// List favorite entries from the running applet via D-Bus (blocking, for CLI use).
 /// Returns Vec<(id, title, preview)>.
-pub fn send_list_favorites() -> Result<Vec<(i64, String, String)>, Box<dyn std::error::Error>> {
+pub fn send_list_favorites() -> Result<Vec<(i64, String, String)>> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -396,7 +398,7 @@ pub fn send_list_favorites() -> Result<Vec<(i64, String, String)>, Box<dyn std::
 
 /// Copy a specific entry by ID via D-Bus (blocking, for CLI use).
 /// Returns Ok(()) on success, Err with message on failure.
-pub fn send_copy_entry(id: i64) -> Result<(), Box<dyn std::error::Error>> {
+pub fn send_copy_entry(id: i64) -> Result<()> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
@@ -409,94 +411,119 @@ pub fn send_copy_entry(id: i64) -> Result<(), Box<dyn std::error::Error>> {
     if result.is_empty() {
         Ok(())
     } else {
-        Err(result.into())
+        bail!("{result}")
     }
 }
 
 /// Async version of send_list_favorites (for use inside a tokio runtime).
-pub async fn send_list_favorites_async() -> Result<Vec<(i64, String, String)>, Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(
-        &connection,
-        BUS_NAME,
-        OBJECT_PATH,
-        INTERFACE_NAME,
-    )
-    .await?;
-    let reply = proxy.call_method("ListFavorites", &()).await?;
-    let entries: Vec<(i64, String, String)> = reply.body().deserialize()?;
-    Ok(entries)
+pub async fn send_list_favorites_async() -> Result<Vec<(i64, String, String)>> {
+    timeout(Duration::from_secs(5), async {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+        )
+        .await?;
+        let reply = proxy.call_method("ListFavorites", &()).await?;
+        let entries: Vec<(i64, String, String)> = reply.body().deserialize()?;
+        Ok(entries)
+    })
+    .await
+    .context("D-Bus list favorites timed out after 5s")?
 }
 
 /// Async version of send_edit_entry (for use inside a tokio runtime).
-pub async fn send_edit_entry_async(id: i64) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(
-        &connection,
-        BUS_NAME,
-        OBJECT_PATH,
-        INTERFACE_NAME,
-    )
-    .await?;
-    proxy.call_method("EditEntry", &(id,)).await?;
-    Ok(())
+pub async fn send_edit_entry_async(id: i64) -> Result<()> {
+    timeout(Duration::from_secs(5), async {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+        )
+        .await?;
+        proxy.call_method("EditEntry", &(id,)).await?;
+        Ok(())
+    })
+    .await
+    .context("D-Bus edit entry timed out after 5s")?
 }
 
 /// Async version of send_get_entry (for use inside a tokio runtime).
-pub async fn send_get_entry_async(id: i64) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(
-        &connection,
-        BUS_NAME,
-        OBJECT_PATH,
-        INTERFACE_NAME,
-    )
-    .await?;
-    let reply = proxy.call_method("GetEntry", &(id,)).await?;
-    let (mime, data, error): (String, Vec<u8>, String) = reply.body().deserialize()?;
-    if error.is_empty() {
-        Ok((mime, data))
-    } else {
-        Err(error.into())
-    }
+pub async fn send_get_entry_async(id: i64) -> Result<(String, Vec<u8>)> {
+    timeout(Duration::from_secs(5), async {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+        )
+        .await?;
+        let reply = proxy.call_method("GetEntry", &(id,)).await?;
+        let (mime, data, error): (String, Vec<u8>, String) = reply.body().deserialize()?;
+        if error.is_empty() {
+            Ok((mime, data))
+        } else {
+            bail!("{error}")
+        }
+    })
+    .await
+    .context("D-Bus get entry timed out after 5s")?
 }
 
 /// Set a favorite's title via D-Bus (async, for use inside a tokio runtime).
 pub async fn send_set_favorite_title_async(
     id: i64,
     title: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME).await?;
-    proxy
-        .call_method("SetFavoriteTitle", &(id, title))
-        .await?;
-    Ok(())
+) -> Result<()> {
+    let title = title.to_string();
+    timeout(Duration::from_secs(5), async {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME).await?;
+        proxy
+            .call_method("SetFavoriteTitle", &(id, &*title))
+            .await?;
+        Ok(())
+    })
+    .await
+    .context("D-Bus set favorite title timed out after 5s")?
 }
 
 /// Remove a favorite via D-Bus (async, for use inside a tokio runtime).
-pub async fn send_remove_favorite_async(id: i64) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME).await?;
-    proxy.call_method("RemoveFavorite", &(id,)).await?;
-    Ok(())
+pub async fn send_remove_favorite_async(id: i64) -> Result<()> {
+    timeout(Duration::from_secs(5), async {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME).await?;
+        proxy.call_method("RemoveFavorite", &(id,)).await?;
+        Ok(())
+    })
+    .await
+    .context("D-Bus remove favorite timed out after 5s")?
 }
 
 /// Async version of send_copy_entry (for use inside a tokio runtime).
-pub async fn send_copy_entry_async(id: i64) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(
-        &connection,
-        BUS_NAME,
-        OBJECT_PATH,
-        INTERFACE_NAME,
-    )
-    .await?;
-    let reply = proxy.call_method("CopyEntry", &(id,)).await?;
-    let result: String = reply.body().deserialize()?;
-    if result.is_empty() {
-        Ok(())
-    } else {
-        Err(result.into())
-    }
+pub async fn send_copy_entry_async(id: i64) -> Result<()> {
+    timeout(Duration::from_secs(5), async {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+        )
+        .await?;
+        let reply = proxy.call_method("CopyEntry", &(id,)).await?;
+        let result: String = reply.body().deserialize()?;
+        if result.is_empty() {
+            Ok(())
+        } else {
+            bail!("{result}")
+        }
+    })
+    .await
+    .context("D-Bus copy entry timed out after 5s")?
 }

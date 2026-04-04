@@ -46,19 +46,19 @@ impl EditorApp {
         if let Some(writer) = IPC_WRITER.get() {
             let mut guard = writer.lock().unwrap();
             if let Err(e) = editor_ipc::write_frame(&mut *guard, msg) {
-                eprintln!("[editor] Failed to send {msg:?}: {e}");
+                error!("[editor] Failed to send {msg:?}: {e}");
             } else {
-                eprintln!("[editor] Sent: {msg:?}");
+                debug!("[editor] Sent: {msg:?}");
             }
         } else {
-            eprintln!("[editor] IPC_WRITER not initialized, can't send {msg:?}");
+            error!("[editor] IPC_WRITER not initialized, can't send {msg:?}");
         }
     }
 
     fn save_and_exit(&mut self) -> ! {
         let text = self.content.text();
         let is_dirty = text.trim() != self.original_text.trim();
-        eprintln!("[editor] save_and_exit: dirty={is_dirty}, is_favorite={}, text_len={}, original_len={}", self.is_favorite, text.len(), self.original_text.len());
+        debug!("[editor] save_and_exit: dirty={is_dirty}, is_favorite={}, text_len={}, original_len={}", self.is_favorite, text.len(), self.original_text.len());
         let msg = if is_dirty {
             if self.is_favorite {
                 EditorToApp::UpdateExisting { content: text }
@@ -206,13 +206,16 @@ impl cosmic::Application for EditorApp {
 
 /// Entry point for the editor process.
 pub fn run_editor() {
-    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::os::unix::io::FromRawFd;
 
     /// The well-known FD for Editor → Applet IPC, set up by the parent process.
-    const IPC_FD: RawFd = 3;
+    const IPC_FD: std::os::unix::io::RawFd = 3;
 
-    // The parent process sets up FD 3 as a dedicated IPC pipe.
-    // No stdout manipulation needed — COSMIC can write to stdout freely.
+    // SAFETY: The parent process (open_editor_process in app.rs) sets up FD 3
+    // as the write end of a dedicated IPC pipe via dup2() in a pre_exec hook.
+    // This is the only code path that reaches here (gated by --editor-window),
+    // so FD 3 is guaranteed to be a valid, open file descriptor that we own.
+    // from_raw_fd() takes ownership, ensuring it is closed when ipc_file drops.
     let ipc_file = unsafe { std::fs::File::from_raw_fd(IPC_FD) };
     IPC_WRITER
         .set(std::sync::Mutex::new(ipc_file))
@@ -224,7 +227,7 @@ pub fn run_editor() {
         match editor_ipc::read_frame::<AppToEditor>(&mut locked) {
             Ok(msg) => msg,
             Err(e) => {
-                eprintln!("Failed to read Init from stdin: {e}");
+                error!("Failed to read Init from stdin: {e}");
                 std::process::exit(1);
             }
         }
@@ -233,7 +236,7 @@ pub fn run_editor() {
     let (content, is_favorite) = match init_msg {
         AppToEditor::Init { content, is_favorite, .. } => (content, is_favorite),
         other => {
-            eprintln!("Expected Init message, got: {other:?}");
+            error!("Expected Init message, got: {other:?}");
             std::process::exit(1);
         }
     };
@@ -249,7 +252,7 @@ pub fn run_editor() {
     };
 
     if let Err(e) = cosmic::app::run::<EditorApp>(settings, flags) {
-        eprintln!("Editor app failed: {e}");
+        error!("Editor app failed: {e}");
         std::process::exit(1);
     }
 }

@@ -9,6 +9,24 @@ use crate::{
     navigation::EventMsg,
 };
 
+/// Wraps a oneshot reply channel in `Arc<Mutex<Option<_>>>` so the message can
+/// derive `Clone` (required by iced). Call `.reply(value)` to send the response
+/// — the first caller wins, subsequent calls are no-ops.
+#[derive(Debug, Clone)]
+pub struct ReplyHandle<T>(pub Arc<Mutex<Option<tokio::sync::oneshot::Sender<T>>>>);
+
+impl<T> ReplyHandle<T> {
+    pub fn new(sender: tokio::sync::oneshot::Sender<T>) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+
+    pub fn reply(&self, value: T) {
+        if let Some(sender) = self.0.lock().unwrap().take() {
+            let _ = sender.send(value);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum AppMsg {
     ChangeConfig(Config),
@@ -33,15 +51,15 @@ pub enum AppMsg {
     LinkClicked(markdown::Url),
     DbusToggle,
     DbusListEntries {
-        reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Vec<EntrySummary>>>>>,
+        reply: ReplyHandle<Vec<EntrySummary>>,
     },
     DbusCopyEntry {
         id: EntryId,
-        reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+        reply: ReplyHandle<Result<(), String>>,
     },
     DbusGetEntry {
         id: EntryId,
-        reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(String, Vec<u8>), String>>>>>,
+        reply: ReplyHandle<Result<(String, Vec<u8>), String>>,
     },
     EditLatest,
     ToggleFavoritesFilter,
@@ -50,7 +68,7 @@ pub enum AppMsg {
     DbusFavorites,
     DbusToggleSelections,
     DbusListFavorites {
-        reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Vec<FavoriteSummary>>>>>,
+        reply: ReplyHandle<Vec<FavoriteSummary>>,
     },
     BeginFavorite(EntryId),
     CancelFavorite,
@@ -73,6 +91,8 @@ pub enum AppMsg {
     RawCursorMoved(cosmic::iced_core::Point),
     /// No-op message used for fire-and-forget async tasks.
     Noop,
+    /// Background DB persist completed (insert, delete, or clear).
+    DbPersistComplete(Result<(), String>),
     /// Logical screen size from a wayland output event, used to clamp popup position.
     OutputSize(f32, f32),
     /// No longer used — kept to avoid breaking handler match.

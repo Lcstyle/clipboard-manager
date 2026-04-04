@@ -1,7 +1,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    thread::sleep,
     time::Duration,
 };
 
@@ -15,7 +14,7 @@ use crate::{
     db::{DbSqlite, DbTrait},
 };
 
-use super::MimeDataMap;
+use super::{EntryId, MimeDataMap, MimeType};
 
 fn prepare_db_dir() -> PathBuf {
     let fmt_layer = fmt::layer().with_target(false);
@@ -53,7 +52,7 @@ async fn test() -> Result<()> {
 fn build_content(content: &[(&str, &str)]) -> MimeDataMap {
     content
         .iter()
-        .map(|(mime, content)| (mime.to_string(), content.as_bytes().into()))
+        .map(|(mime, content)| (MimeType::new(mime.to_string()), content.as_bytes().into()))
         .collect()
 }
 
@@ -66,13 +65,13 @@ async fn test_db(db: &mut DbSqlite) -> Result<()> {
 
     assert!(db.len() == 1);
 
-    sleep(Duration::from_millis(1000));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     db.insert_with_time(data.clone(), 20).await.unwrap();
 
     assert!(db.len() == 1);
 
-    sleep(Duration::from_millis(1000));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let data2 = build_content(&[("text/plain", "content2")]);
 
@@ -100,7 +99,7 @@ async fn test_delete_old_one() {
 
     db.insert(data).await.unwrap();
 
-    sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let data = build_content(&[("text/plain", "content2")]);
 
@@ -150,40 +149,43 @@ async fn favorites() {
         .await
         .unwrap();
 
-    let now1 = 1000;
+    let now1 = 1000i64;
+    let id1 = EntryId(now1);
     let data1 = build_content(&[("text/plain", "content1")]);
     db.insert_with_time(data1, now1).await.unwrap();
 
-    let now2 = 2000;
+    let now2 = 2000i64;
+    let id2 = EntryId(now2);
     let data2 = build_content(&[("text/plain", "content2")]);
     db.insert_with_time(data2, now2).await.unwrap();
 
-    let now3 = 3000;
+    let now3 = 3000i64;
+    let id3 = EntryId(now3);
     let data3 = build_content(&[("text/plain", "content3")]);
     db.insert_with_time(data3.clone(), now3).await.unwrap();
 
-    db.add_favorite(now3, None).await.unwrap();
+    db.add_favorite(id3, None).await.unwrap();
 
-    assert!(db.get_from_id(now3).unwrap().is_favorite);
+    assert!(db.get_from_id(id3).unwrap().is_favorite);
     assert_eq!(db.favorites.len(), 1);
 
-    db.delete(now3).await.unwrap();
+    db.delete(id3).await.unwrap();
 
     assert_eq!(db.favorites.len(), 0);
 
     db.insert_with_time(data3.clone(), now3).await.unwrap();
 
-    db.add_favorite(now1, None).await.unwrap();
+    db.add_favorite(id1, None).await.unwrap();
 
-    db.add_favorite(now3, None).await.unwrap();
+    db.add_favorite(id3, None).await.unwrap();
 
-    db.add_favorite(now2, Some(1)).await.unwrap();
+    db.add_favorite(id2, Some(1)).await.unwrap();
 
     assert_eq!(db.favorites.len(), 3);
 
-    assert_eq!(db.favorites.fav(), &vec![now1, now2, now3]);
+    assert_eq!(db.favorites.fav(), &vec![id1, id2, id3]);
 
-    db.remove_favorite(now2).await.unwrap();
+    db.remove_favorite(id2).await.unwrap();
 
     assert_eq!(db.len(), 3);
 
@@ -201,7 +203,7 @@ async fn favorites() {
     assert_eq!(db.len(), 2);
 
     assert_eq!(db.favorites.len(), 2);
-    assert_eq!(db.favorites.fav(), &vec![now1, now3]);
+    assert_eq!(db.favorites.fav(), &vec![id1, id3]);
 }
 
 #[tokio::test]

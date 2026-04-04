@@ -11,7 +11,7 @@ use futures::{Stream, future::join_all};
 use itertools::Itertools;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 
-use crate::{clipboard_watcher, config::{PRIVATE_MODE, SELECTION_BUFFER_ENABLED}, db::MimeDataMap};
+use crate::{clipboard_watcher, config::{PRIVATE_MODE, SELECTION_BUFFER_ENABLED}, db::{MimeDataMap, MimeType}};
 
 #[derive(Debug, Clone)]
 pub enum ClipboardMessage {
@@ -23,6 +23,7 @@ pub enum ClipboardMessage {
     Error(ClipboardError),
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ClipboardError {
     #[error(transparent)]
@@ -35,13 +36,88 @@ enum WatchRes<I> {
     Err(clipboard_watcher::Error),
 }
 
+/// Read all offered MIME types from clipboard pipes with a 500ms timeout each.
+async fn read_pipes(
+    pipes: impl IntoIterator<Item = (String, impl tokio::io::AsyncRead + Unpin)>,
+    label: &str,
+) -> MimeDataMap {
+    let reads = pipes.into_iter().map(|(mime_type, mut pipe)| {
+        let label = label.to_string();
+        async move {
+            let mut contents = Vec::new();
+            match tokio::time::timeout(
+                Duration::from_millis(500),
+                pipe.read_to_end(&mut contents),
+            )
+            .await
+            {
+                Ok(Ok(len)) if len > 0 => Some((MimeType::new(mime_type), contents)),
+                Ok(Ok(_)) => {
+                    debug!("{label}data is empty: {mime_type}");
+                    None
+                }
+                Ok(Err(e)) => {
+                    warn!("{label}read error on pipe: {mime_type} {e}");
+                    None
+                }
+                Err(e) => {
+                    warn!("{label}read timeout on pipe: {mime_type} {e}");
+                    None
+                }
+            }
+        }
+    });
+    join_all(reads).await.into_iter().flatten().collect()
+}
+
+/// Shared recv-loop for both clipboard and primary-selection watchers.
+async fn clipboard_recv_loop(
+    mut rx: mpsc::Receiver<WatchRes<impl IntoIterator<Item = (String, impl tokio::io::AsyncRead + Unpin)>>>,
+    mut output: impl SinkExt<ClipboardMessage> + Unpin,
+    label: &str,
+) {
+    loop {
+        match rx.recv().await {
+            Some(WatchRes::Some(res)) => {
+                let data = read_pipes(res, label).await;
+                if !data.is_empty() {
+                    if label.is_empty() {
+                        let mimes = data
+                            .iter()
+                            .map(|(m, d)| (m.to_string(), d.len()))
+                            .collect_vec();
+                        debug!("send mime types to db: {mimes:?}");
+                    }
+                    let _ = output.send(ClipboardMessage::Data(data)).await;
+                }
+            }
+            Some(WatchRes::None) => {
+                debug!("{label}empty clipboard");
+                let _ = output.send(ClipboardMessage::EmptyKeyboard).await;
+            }
+            Some(WatchRes::Err(e)) => {
+                let _ = output
+                    .send(ClipboardMessage::Error(ClipboardError::Watch(e.into())))
+                    .await;
+                std::future::pending::<()>().await;
+            }
+            None => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 pub fn sub() -> impl Stream<Item = ClipboardMessage> {
     channel(50, move |mut output| {
         async move {
             match clipboard_watcher::Watcher::init(false) {
                 Ok(mut clipboard_watcher) => {
-                    let (tx, mut rx) = mpsc::channel(5);
+                    let (tx, rx) = mpsc::channel(5);
 
+                    // JoinHandle intentionally dropped: the blocking task communicates
+                    // errors back through `tx` (as WatchRes::Err), and if it panics the
+                    // channel closes, which the recv loop below handles as the None arm.
                     tokio::task::spawn_blocking(move || {
                         loop {
                             debug!("start watching");
@@ -71,83 +147,14 @@ pub fn sub() -> impl Stream<Item = ClipboardMessage> {
                             }
                         }
                     });
-                    output.send(ClipboardMessage::Connected).await.unwrap();
-
-                    let mut i = 0;
-                    loop {
-                        let s = debug_span!("", i);
-                        let _s = s.enter();
-                        i += 1;
-
-                        match rx.recv().await {
-                            Some(WatchRes::Some(res)) => {
-                                let reads = res.into_iter().map(|(mime_type, mut pipe)| async move {
-                                    let mut contents = Vec::new();
-                                    match tokio::time::timeout(
-                                        Duration::from_millis(500),
-                                        pipe.read_to_end(&mut contents),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(len)) if len > 0 => Some((mime_type, contents)),
-                                        Ok(Ok(_)) => {
-                                            debug!("data is empty: {mime_type}");
-                                            None
-                                        }
-                                        Ok(Err(e)) => {
-                                            warn!("read error on external pipe clipboard: {mime_type} {e}");
-                                            None
-                                        }
-                                        Err(e) => {
-                                            warn!("read timeout on external pipe clipboard: {mime_type} {e}");
-                                            None
-                                        }
-                                    }
-                                });
-
-                                let data: MimeDataMap = join_all(reads)
-                                    .await
-                                    .into_iter()
-                                    .flatten()
-                                    .collect();
-
-                                if !data.is_empty() {
-                                    let mimes = data
-                                        .iter()
-                                        .map(|(m, d)| (m.to_string(), d.len()))
-                                        .collect_vec();
-
-                                    debug!("send mime types to db: {mimes:?}");
-                                    output.send(ClipboardMessage::Data(data)).await.unwrap();
-                                }
-                            }
-
-                            Some(WatchRes::None) => {
-                                debug!("empty keyboard");
-                                output.send(ClipboardMessage::EmptyKeyboard).await.unwrap();
-                            }
-                            Some(WatchRes::Err(e)) => {
-                                output
-                                    .send(ClipboardMessage::Error(ClipboardError::Watch(e.into())))
-                                    .await
-                                    .unwrap();
-                                std::future::pending::<()>().await;
-                            }
-                            None => {
-                                std::future::pending::<()>().await;
-                            }
-                        }
-                    }
+                    let _ = output.send(ClipboardMessage::Connected).await;
+                    clipboard_recv_loop(rx, output, "").await;
                 }
 
                 Err(e) => {
-                    // todo: how to cancel properly?
-                    // https://github.com/pop-os/cosmic-files/blob/d96d48995d49e17f01903ca4d89839eb4a1b1104/src/app.rs#L1704
-                    output
+                    let _ = output
                         .send(ClipboardMessage::Error(ClipboardError::Watch(e.into())))
-                        .await
-                        .unwrap();
-
+                        .await;
                     std::future::pending::<()>().await;
                 }
             };
@@ -160,8 +167,9 @@ pub fn primary_sub() -> impl Stream<Item = ClipboardMessage> {
         async move {
             match clipboard_watcher::Watcher::init(true) {
                 Ok(mut clipboard_watcher) => {
-                    let (tx, mut rx) = mpsc::channel(5);
+                    let (tx, rx) = mpsc::channel(5);
 
+                    // JoinHandle intentionally dropped: see comment in sub() above.
                     tokio::task::spawn_blocking(move || {
                         loop {
                             debug!("primary: start watching");
@@ -191,70 +199,14 @@ pub fn primary_sub() -> impl Stream<Item = ClipboardMessage> {
                             }
                         }
                     });
-                    output.send(ClipboardMessage::Connected).await.unwrap();
-
-                    loop {
-                        match rx.recv().await {
-                            Some(WatchRes::Some(res)) => {
-                                let reads = res.into_iter().map(|(mime_type, mut pipe)| async move {
-                                    let mut contents = Vec::new();
-                                    match tokio::time::timeout(
-                                        Duration::from_millis(500),
-                                        pipe.read_to_end(&mut contents),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(len)) if len > 0 => Some((mime_type, contents)),
-                                        Ok(Ok(_)) => {
-                                            debug!("primary: data is empty: {mime_type}");
-                                            None
-                                        }
-                                        Ok(Err(e)) => {
-                                            warn!("primary: read error on pipe: {mime_type} {e}");
-                                            None
-                                        }
-                                        Err(e) => {
-                                            warn!("primary: read timeout on pipe: {mime_type} {e}");
-                                            None
-                                        }
-                                    }
-                                });
-
-                                let data: MimeDataMap = join_all(reads)
-                                    .await
-                                    .into_iter()
-                                    .flatten()
-                                    .collect();
-
-                                if !data.is_empty() {
-                                    output.send(ClipboardMessage::Data(data)).await.unwrap();
-                                }
-                            }
-
-                            Some(WatchRes::None) => {
-                                debug!("primary: empty selection");
-                                output.send(ClipboardMessage::EmptyKeyboard).await.unwrap();
-                            }
-                            Some(WatchRes::Err(e)) => {
-                                output
-                                    .send(ClipboardMessage::Error(ClipboardError::Watch(e.into())))
-                                    .await
-                                    .unwrap();
-                                std::future::pending::<()>().await;
-                            }
-                            None => {
-                                std::future::pending::<()>().await;
-                            }
-                        }
-                    }
+                    let _ = output.send(ClipboardMessage::Connected).await;
+                    clipboard_recv_loop(rx, output, "primary: ").await;
                 }
 
                 Err(e) => {
-                    output
+                    let _ = output
                         .send(ClipboardMessage::Error(ClipboardError::Watch(e.into())))
-                        .await
-                        .unwrap();
-
+                        .await;
                     std::future::pending::<()>().await;
                 }
             };
