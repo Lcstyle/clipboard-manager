@@ -117,6 +117,11 @@ pub struct AppState<Db: DbTrait> {
     pub show_favorites_only: bool,
     pub current_entry_id: Option<EntryId>,
     pub selection_buffer: SelectionBuffer,
+    /// Debounce: pending primary selection text waiting to be committed.
+    /// Reset on each new selection event; flushed after 300ms of no changes.
+    pending_primary_text: Option<(String, Vec<u8>)>,
+    /// Monotonic counter to invalidate stale debounce flushes.
+    primary_debounce_seq: u64,
     /// Temporary overlay for capturing cursor position before opening a positioned popup.
     cursor_capture: Option<CursorCapture>,
     /// Suppress LayerEvent::Unfocused while a layer surface popup is open.
@@ -634,6 +639,8 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             show_favorites_only: false,
             current_entry_id: None,
             selection_buffer: SelectionBuffer::new(config.selection_buffer_max_entries),
+            pending_primary_text: None,
+            primary_debounce_seq: 0,
             cursor_capture: None,
             suppress_unfocus: false,
             popup_position: None,
@@ -888,21 +895,19 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     if let Some(text_data) = data.get(&MimeType::new("text/plain".to_string())) {
                         if let Ok(text) = String::from_utf8(text_data.clone()) {
                             if self.config.selection_buffer_enabled {
-                                // Always insert into the in-memory selection buffer
-                                self.selection_buffer.push(text.clone());
-
-                                if self.config.selection_buffer_sync_clipboard {
-                                    // Set skip flag so the regular watcher doesn't persist to DB
-                                    SKIP_NEXT_CLIPBOARD.store(true, atomic::Ordering::Release);
-
-                                    // Copy to clipboard for immediate Ctrl+V
-                                    if let Err(e) = wl_copy("text/plain", text_data) {
-                                        // Clear skip flag on failure
-                                        SKIP_NEXT_CLIPBOARD.store(false, atomic::Ordering::Release);
-                                        error!("primary sync: clipboard copy failed: {e}");
-                                    }
-                                }
-                                // If sync_clipboard is false, text only goes to buffer (no copy)
+                                // Debounce: store pending text, bump sequence, schedule flush.
+                                // Each new selection event resets the timer. Only when 300ms pass
+                                // with no new events does FlushPrimarySelection fire.
+                                self.pending_primary_text = Some((text, text_data.clone()));
+                                self.primary_debounce_seq += 1;
+                                let seq = self.primary_debounce_seq;
+                                return Task::perform(
+                                    async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                        seq
+                                    },
+                                    |seq| cosmic::action::app(AppMsg::FlushPrimarySelection(seq)),
+                                );
                             } else {
                                 // Selection buffer disabled — old behavior: copy to clipboard
                                 if let Err(e) = wl_copy("text/plain", text_data) {
@@ -919,6 +924,22 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     error!("primary clipboard: {e}");
                 }
             },
+            AppMsg::FlushPrimarySelection(seq) => {
+                // Only flush if this matches the latest sequence (not stale).
+                if seq == self.primary_debounce_seq {
+                    if let Some((text, text_data)) = self.pending_primary_text.take() {
+                        self.selection_buffer.push(text);
+
+                        if self.config.selection_buffer_sync_clipboard {
+                            SKIP_NEXT_CLIPBOARD.store(true, atomic::Ordering::Release);
+                            if let Err(e) = wl_copy("text/plain", &text_data) {
+                                SKIP_NEXT_CLIPBOARD.store(false, atomic::Ordering::Release);
+                                error!("primary sync: clipboard copy failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
             AppMsg::Copy(id) => {
                 self.current_entry_id = Some(id);
                 let task = match self.db.get_from_id(id) {
@@ -1037,9 +1058,8 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             }
             AppMsg::ContextMenu(msg) => match msg {
                 ContextMenuMsg::RemoveFavorite(entry) => {
-                    if let Err(err) = block_on(self.db.remove_favorite(entry)) {
-                        error!("{err}");
-                    }
+                    let op = self.db.remove_favorite_from_memory(entry);
+                    return spawn_db_persist(self.db.db_path(), op);
                 }
                 ContextMenuMsg::AddFavorite(entry) => {
                     // If already a favorite, this is a "Rename" action
@@ -1192,12 +1212,20 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                             } else {
                                 let mut data = MimeDataMap::new();
                                 data.insert(MimeType::new("text/plain".to_string()), content.as_bytes().to_vec());
-                                match block_on(self.db.update_content(entry_id, data.clone())) {
-                                    Ok(_new_id) => {
+                                match self.db.update_content_in_memory(entry_id, data.clone()) {
+                                    Some(op) => {
                                         eprintln!("[applet] UpdateExisting: updated entry {entry_id}");
-                                        return copy_iced(data);
+                                        let persist = spawn_db_persist(self.db.db_path(), op);
+                                        return Task::batch([copy_iced(data), persist]);
                                     }
-                                    Err(e) => error!("failed to update entry: {e}"),
+                                    None => {
+                                        // Dedup detected — fall back to sync path
+                                        if let Err(e) = block_on(self.db.update_content(entry_id, data.clone())) {
+                                            error!("failed to update entry: {e}");
+                                        } else {
+                                            return copy_iced(data);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1238,15 +1266,17 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     let text = entry.text.clone();
                     let mut data = MimeDataMap::new();
                     data.insert(MimeType::new("text/plain".to_string()), text.as_bytes().to_vec());
-                    if let Some(op) = self.db.insert_to_memory(data) {
+                    if let Some(insert_op) = self.db.insert_to_memory(data) {
                         // Get the newly inserted entry's ID (first in chronological order)
                         let new_id = self.db.chronological_iter().next().map(|e| e.id());
+                        let db_path = self.db.db_path();
+                        let insert_task = spawn_db_persist(db_path, insert_op);
                         if let Some(new_id) = new_id {
-                            if let Err(e) = block_on(self.db.add_favorite(new_id, None)) {
-                                error!("failed to add favorite: {e}");
-                            }
+                            let fav_op = self.db.add_favorite_to_memory(new_id, None);
+                            let fav_task = spawn_db_persist(self.db.db_path(), fav_op);
+                            return Task::batch([insert_task, fav_task]);
                         }
-                        return spawn_db_persist(self.db.db_path(), op);
+                        return insert_task;
                     }
                 }
             }
@@ -1329,25 +1359,26 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             }
             AppMsg::ConfirmFavorite(id, title) => {
                 let already_fav = self.db.get_from_id(id).is_some_and(|e| e.is_favorite());
+                let mut tasks = Vec::new();
                 if !already_fav {
-                    if let Err(err) = block_on(self.db.add_favorite(id, None)) {
-                        error!("{err}");
-                    }
+                    let op = self.db.add_favorite_to_memory(id, None);
+                    tasks.push(spawn_db_persist(self.db.db_path(), op));
                 }
                 let title = title.filter(|t| !t.trim().is_empty());
-                if let Err(err) = block_on(self.db.set_favorite_title(id, title)) {
-                    error!("{err}");
-                }
+                let title_op = self.db.set_favorite_title_in_memory(id, title);
+                tasks.push(spawn_db_persist(self.db.db_path(), title_op));
                 self.favoriting_state = None;
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
+                }
             }
             AppMsg::CancelFavorite => {
                 self.favoriting_state = None;
             }
             AppMsg::SetFavoriteTitle(id, title) => {
                 let title = if title.trim().is_empty() { None } else { Some(title) };
-                if let Err(err) = block_on(self.db.set_favorite_title(id, title)) {
-                    error!("{err}");
-                }
+                let op = self.db.set_favorite_title_in_memory(id, title);
+                return spawn_db_persist(self.db.db_path(), op);
             }
             AppMsg::SuggestTitle(id) => {
                 // Re-trigger AI suggestion for an existing favorite

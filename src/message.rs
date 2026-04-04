@@ -91,6 +91,9 @@ pub enum AppMsg {
     RawCursorMoved(cosmic::iced_core::Point),
     /// No-op message used for fire-and-forget async tasks.
     Noop,
+    /// Debounced primary selection ready to commit. The u64 is a sequence number —
+    /// if it doesn't match the current `primary_debounce_seq`, the flush is stale.
+    FlushPrimarySelection(u64),
     /// Background DB persist completed (insert, delete, or clear).
     DbPersistComplete(Result<(), String>),
     /// Logical screen size from a wayland output event, used to clamp popup position.
@@ -138,4 +141,36 @@ pub enum ConfigMsg {
     UniqueSession(bool),
     SelectionBufferEnabled(bool),
     SelectionBufferSyncClipboard(bool),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn test_reply_handle_first_wins() {
+        let (tx, rx) = oneshot::channel::<i32>();
+        let handle = ReplyHandle::new(tx);
+        handle.reply(42);
+        assert_eq!(rx.blocking_recv().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_reply_handle_second_is_noop() {
+        let (tx, _rx) = oneshot::channel::<i32>();
+        let handle = ReplyHandle::new(tx);
+        handle.reply(1); // first reply
+        handle.reply(2); // no-op, no panic
+    }
+
+    #[test]
+    fn test_reply_handle_clone() {
+        let (tx, rx) = oneshot::channel::<String>();
+        let h1 = ReplyHandle::new(tx);
+        let h2 = h1.clone();
+        h2.reply("from clone".into());
+        assert_eq!(rx.blocking_recv().unwrap(), "from clone");
+        h1.reply("too late".into()); // no-op
+    }
 }

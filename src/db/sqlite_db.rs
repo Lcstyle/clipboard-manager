@@ -21,9 +21,7 @@ use crate::{
     utils::{self},
 };
 
-use super::{DbMessage, DbPersistOp, DbTrait, EntryId, EntryTrait, MimeDataMap, MimeType, PRIV_MIME_TYPES_SIMPLE, now};
-
-type Time = i64;
+use super::{DbMessage, DbPersistOp, DbTrait, EntryId, EntryTrait, MimeDataMap, MimeType, TimestampMillis, PRIV_MIME_TYPES_SIMPLE, now};
 
 const DB_VERSION: &str = "7";
 const DB_PATH: &str = constcat::concat!(APPID, "-db-", DB_VERSION, ".sqlite");
@@ -39,7 +37,7 @@ pub struct DbSqlite {
     /// Hash -> Id
     hashs: HashMap<u64, EntryId>,
     /// time -> Id
-    times: BTreeMap<Time, EntryId>,
+    times: BTreeMap<TimestampMillis, EntryId>,
     /// Id -> Entry
     entries: HashMap<EntryId, Entry>,
     filtered: Vec<EntryId>,
@@ -57,7 +55,7 @@ pub struct DbSqlite {
 #[derive(Clone)]
 pub struct Entry {
     pub id: EntryId,
-    pub creation: Time,
+    pub creation: TimestampMillis,
     // todo: lazelly load image in memory, since we can't search them anyways?
     /// (Mime, Content)
     pub raw_content: MimeDataMap,
@@ -288,7 +286,7 @@ impl DbTrait for DbSqlite {
                 .await?
             {
                 Some(r) => {
-                    let creation: Time = r.get("creation");
+                    let creation: TimestampMillis = r.get("creation");
 
                     let query_delete_old_one = r#"
                 
@@ -437,7 +435,7 @@ impl DbTrait for DbSqlite {
     async fn insert(&mut self, data: MimeDataMap) -> Result<()> {
         self.insert_with_time(data, now()).await
     }
-    async fn insert_with_time(&mut self, data: MimeDataMap, now: i64) -> Result<()> {
+    async fn insert_with_time(&mut self, data: MimeDataMap, now: TimestampMillis) -> Result<()> {
         if !self.lock.owns_lock() {
             info!("db already locked");
             return Ok(());
@@ -466,7 +464,7 @@ impl DbTrait for DbSqlite {
                 .execute(&mut self.conn)
                 .await?;
         } else {
-            let id = EntryId(now);
+            let id = EntryId(now.as_i64());
 
             let query_insert_new_entry = r#"
                 INSERT INTO ClipboardEntries (id, creation)
@@ -562,7 +560,7 @@ impl DbTrait for DbSqlite {
             self.search();
             Some(DbPersistOp::UpdateTimestamp { id, new_time: now })
         } else {
-            let id = EntryId(now);
+            let id = EntryId(now.as_i64());
 
             let entry = Entry {
                 id,
@@ -649,6 +647,83 @@ impl DbTrait for DbSqlite {
 
     fn db_path(&self) -> &str {
         &self.db_file_path
+    }
+
+    fn add_favorite_to_memory(&mut self, id: EntryId, index: Option<usize>) -> DbPersistOp {
+        self.favorites.insert_at(id, index);
+
+        let position = index.unwrap_or(self.favorites.len() - 1);
+
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.is_favorite = true;
+            e.favorite_title = None;
+        }
+
+        DbPersistOp::AddFavorite {
+            id,
+            position,
+            bump_from: index,
+        }
+    }
+
+    fn remove_favorite_from_memory(&mut self, id: EntryId) -> DbPersistOp {
+        let old_position = self.favorites.remove(&id);
+
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.is_favorite = false;
+            e.favorite_title = None;
+        }
+
+        DbPersistOp::RemoveFavorite { id, old_position }
+    }
+
+    fn set_favorite_title_in_memory(&mut self, id: EntryId, title: Option<String>) -> DbPersistOp {
+        self.favorites.set_title(id, title.clone());
+
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.favorite_title = title.clone();
+        }
+
+        DbPersistOp::SetFavoriteTitle { id, title }
+    }
+
+    fn update_content_in_memory(&mut self, id: EntryId, data: MimeDataMap) -> Option<DbPersistOp> {
+        let new_hash = get_hash_entry_content(&data);
+        let now = now();
+
+        // Check for dedup against a *different* existing entry
+        if let Some(&existing_id) = self.hashs.get(&new_hash) {
+            if existing_id != id {
+                // Dedup case — too complex for a simple memory op.
+                // Caller should fall back to block_on or handle differently.
+                return None;
+            }
+        }
+
+        // Remove old hash
+        if let Some(entry) = self.entries.get(&id) {
+            let old_hash = entry.get_hash();
+            self.hashs.remove(&old_hash);
+        }
+
+        // Update in-memory state
+        if let Some(entry) = self.entries.get_mut(&id) {
+            let old_creation = entry.creation;
+            self.times.remove(&old_creation);
+            entry.creation = now;
+            entry.raw_content = data.clone();
+            self.times.insert(now, id);
+        }
+
+        // Insert new hash
+        self.hashs.insert(new_hash, id);
+
+        self.search();
+        Some(DbPersistOp::UpdateContent {
+            id,
+            data,
+            new_time: now,
+        })
     }
 
     async fn update_content(&mut self, id: EntryId, data: MimeDataMap) -> Result<EntryId> {

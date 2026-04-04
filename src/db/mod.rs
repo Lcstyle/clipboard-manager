@@ -13,8 +13,8 @@ pub mod test;
 mod sqlite_db;
 pub use sqlite_db::DbSqlite;
 
-fn now() -> i64 {
-    Utc::now().timestamp_millis()
+fn now() -> TimestampMillis {
+    TimestampMillis(Utc::now().timestamp_millis())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -71,6 +71,47 @@ impl MimeType {
 impl std::fmt::Display for MimeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Milliseconds since Unix epoch. Used for entry creation timestamps.
+/// Distinct from EntryId (which happens to also be a millisecond timestamp)
+/// to prevent accidental mixing of IDs and times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimestampMillis(pub(crate) i64);
+
+impl TimestampMillis {
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TimestampMillis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for TimestampMillis {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <i64 as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for TimestampMillis {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <i64 as sqlx::Encode<sqlx::Sqlite>>::encode_by_ref(&self.0, buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for TimestampMillis {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        <i64 as sqlx::Decode<sqlx::Sqlite>>::decode(value).map(TimestampMillis)
     }
 }
 
@@ -234,7 +275,7 @@ pub trait DbTrait: Sized {
 
     async fn insert(&mut self, data: MimeDataMap) -> Result<()>;
 
-    async fn insert_with_time(&mut self, data: MimeDataMap, time: i64) -> Result<()>;
+    async fn insert_with_time(&mut self, data: MimeDataMap, time: TimestampMillis) -> Result<()>;
 
     /// Update in-memory state for an insert (dedup, eviction) without touching
     /// SQLite.  Returns `None` when the DB lock is not held (no-op) or a
@@ -250,6 +291,19 @@ pub trait DbTrait: Sized {
 
     /// Path to the SQLite database file (for opening background connections).
     fn db_path(&self) -> &str;
+
+    /// Add a favorite in-memory only, returning the persist op for background SQL.
+    fn add_favorite_to_memory(&mut self, id: EntryId, index: Option<usize>) -> DbPersistOp;
+
+    /// Remove a favorite in-memory only, returning the persist op for background SQL.
+    fn remove_favorite_from_memory(&mut self, id: EntryId) -> DbPersistOp;
+
+    /// Set a favorite's title in-memory only, returning the persist op for background SQL.
+    fn set_favorite_title_in_memory(&mut self, id: EntryId, title: Option<String>) -> DbPersistOp;
+
+    /// Update an entry's content in-memory only, returning the persist op for background SQL.
+    /// Returns `None` if dedup detected (the caller should handle that case separately).
+    fn update_content_in_memory(&mut self, id: EntryId, data: MimeDataMap) -> Option<DbPersistOp>;
 
     #[must_use = "returns the (possibly different) EntryId after dedup"]
     async fn update_content(&mut self, id: EntryId, data: MimeDataMap) -> Result<EntryId>;
@@ -304,12 +358,12 @@ pub enum DbPersistOp {
     /// Duplicate entry detected — just bump its timestamp.
     UpdateTimestamp {
         id: EntryId,
-        new_time: i64,
+        new_time: TimestampMillis,
     },
     /// Brand new entry — insert rows and optionally evict old entries.
     InsertNew {
         id: EntryId,
-        time: i64,
+        time: TimestampMillis,
         data: MimeDataMap,
         evictions: Vec<EntryId>,
     },
@@ -319,6 +373,28 @@ pub enum DbPersistOp {
     },
     /// Clear all non-favorite entries.
     ClearNonFavorites,
+    /// Add an entry to favorites.
+    AddFavorite {
+        id: EntryId,
+        position: usize,
+        bump_from: Option<usize>,
+    },
+    /// Remove an entry from favorites, adjusting positions.
+    RemoveFavorite {
+        id: EntryId,
+        old_position: Option<usize>,
+    },
+    /// Set or clear a favorite's title.
+    SetFavoriteTitle {
+        id: EntryId,
+        title: Option<String>,
+    },
+    /// Update an entry's content (delete old rows, insert new ones, bump timestamp).
+    UpdateContent {
+        id: EntryId,
+        data: MimeDataMap,
+        new_time: TimestampMillis,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -383,6 +459,70 @@ pub async fn persist_op(db_path: &str, op: DbPersistOp) -> Result<()> {
             )
             .execute(&mut conn)
             .await?;
+        }
+        DbPersistOp::AddFavorite {
+            id,
+            position,
+            bump_from,
+        } => {
+            if let Some(bump_pos) = bump_from {
+                sqlx::query(
+                    "UPDATE FavoriteClipboardEntries SET position = position + 1 WHERE position >= ?",
+                )
+                .bind(bump_pos as i32)
+                .execute(&mut conn)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO FavoriteClipboardEntries (id, position, title) VALUES ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(position as i32)
+            .bind(Option::<String>::None)
+            .execute(&mut conn)
+            .await?;
+        }
+        DbPersistOp::RemoveFavorite { id, old_position } => {
+            sqlx::query("DELETE FROM FavoriteClipboardEntries WHERE id = ?")
+                .bind(id)
+                .execute(&mut conn)
+                .await?;
+            if let Some(pos) = old_position {
+                sqlx::query(
+                    "UPDATE FavoriteClipboardEntries SET position = position - 1 WHERE position >= ?",
+                )
+                .bind(pos as i32)
+                .execute(&mut conn)
+                .await?;
+            }
+        }
+        DbPersistOp::SetFavoriteTitle { id, title } => {
+            sqlx::query("UPDATE FavoriteClipboardEntries SET title = ? WHERE id = ?")
+                .bind(&title)
+                .bind(id)
+                .execute(&mut conn)
+                .await?;
+        }
+        DbPersistOp::UpdateContent { id, data, new_time } => {
+            sqlx::query("DELETE FROM ClipboardContents WHERE id = ?")
+                .bind(id)
+                .execute(&mut conn)
+                .await?;
+            for (mime, content) in &data {
+                sqlx::query(
+                    "INSERT INTO ClipboardContents (id, mime, content) SELECT $1, $2, $3",
+                )
+                .bind(id)
+                .bind(mime.as_str())
+                .bind(content)
+                .execute(&mut conn)
+                .await?;
+            }
+            sqlx::query("UPDATE ClipboardEntries SET creation = $1 WHERE id = $2")
+                .bind(new_time)
+                .bind(id)
+                .execute(&mut conn)
+                .await?;
         }
     }
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -11,10 +12,153 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use crate::{
     config::Config,
-    db::{DbSqlite, DbTrait},
+    db::{DbSqlite, DbTrait, DbPersistOp, EntryTrait},
 };
 
-use super::{EntryId, MimeDataMap, MimeType};
+use super::{Content, EntryId, MimeDataMap, MimeType, TimestampMillis, find_alt};
+
+// ── MimeType ────────────────────────────────────────────────────────
+
+#[test]
+fn test_mime_type_display() {
+    let m = MimeType::new("text/plain".into());
+    assert_eq!(m.to_string(), "text/plain");
+    assert_eq!(m.as_str(), "text/plain");
+}
+
+#[test]
+fn test_mime_type_eq_hash() {
+    let mut map = HashMap::new();
+    map.insert(MimeType::new("text/plain".into()), vec![1u8]);
+    assert!(map.contains_key(&MimeType::new("text/plain".into())));
+    assert!(!map.contains_key(&MimeType::new("image/png".into())));
+}
+
+#[test]
+fn test_mime_type_clone() {
+    let a = MimeType::new("image/png".into());
+    let b = a.clone();
+    assert_eq!(a, b);
+}
+
+// ── EntryId ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_entry_id_display() {
+    let id = EntryId(12345);
+    assert_eq!(id.to_string(), "12345");
+    assert_eq!(id.as_i64(), 12345);
+}
+
+#[test]
+fn test_entry_id_eq_copy() {
+    let a = EntryId(1);
+    let b = a; // Copy
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_entry_id_ord() {
+    assert!(EntryId(1) < EntryId(2));
+    assert_eq!(EntryId(5), EntryId(5));
+}
+
+#[test]
+fn test_entry_id_hash() {
+    let mut map = HashMap::new();
+    map.insert(EntryId(42), "hello");
+    assert_eq!(map.get(&EntryId(42)), Some(&"hello"));
+    assert_eq!(map.get(&EntryId(99)), None);
+}
+
+// ── TimestampMillis ─────────────────────────────────────────────────
+
+#[test]
+fn test_timestamp_millis_display() {
+    let t = TimestampMillis(1000);
+    assert_eq!(t.as_i64(), 1000);
+    assert_eq!(t.to_string(), "1000");
+}
+
+#[test]
+fn test_timestamp_millis_ord() {
+    assert!(TimestampMillis(100) < TimestampMillis(200));
+    assert!(TimestampMillis(300) > TimestampMillis(200));
+    assert_eq!(TimestampMillis(50), TimestampMillis(50));
+}
+
+#[test]
+fn test_timestamp_millis_copy() {
+    let a = TimestampMillis(999);
+    let b = a; // Copy
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_timestamp_millis_hash() {
+    let mut map = HashMap::new();
+    map.insert(TimestampMillis(123), "ts");
+    assert!(map.contains_key(&TimestampMillis(123)));
+    assert!(!map.contains_key(&TimestampMillis(456)));
+}
+
+// ── Content ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_content_text() {
+    let raw = b"hello world";
+    let c = Content::try_new("text/plain", raw).unwrap();
+    assert!(matches!(c, Some(Content::Text("hello world"))));
+}
+
+#[test]
+fn test_content_image() {
+    let raw: &[u8] = &[0xFF, 0xD8, 0xFF];
+    let c = Content::try_new("image/png", raw).unwrap();
+    assert!(matches!(c, Some(Content::Image(_))));
+}
+
+#[test]
+fn test_content_uri_list() {
+    let raw = b"file:///a\nfile:///b\n# comment\n";
+    let c = Content::try_new("text/uri-list", raw).unwrap();
+    match c {
+        Some(Content::UriList(uris)) => {
+            assert_eq!(uris, vec!["file:///a", "file:///b"]);
+        }
+        other => panic!("expected UriList, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_content_unsupported_mime() {
+    let raw = b"data";
+    let c = Content::try_new("application/octet-stream", raw).unwrap();
+    assert!(c.is_none());
+}
+
+// ── find_alt ────────────────────────────────────────────────────────
+
+#[test]
+fn test_find_alt_present() {
+    let html = r#"<img src="x.png" alt="my image" />"#;
+    assert_eq!(find_alt(html), Some("my image"));
+}
+
+#[test]
+fn test_find_alt_missing() {
+    let html = "<p>no image here</p>";
+    assert_eq!(find_alt(html), None);
+}
+
+// ── DbPersistOp ─────────────────────────────────────────────────────
+
+#[test]
+fn test_db_persist_op_clone_debug() {
+    let op = DbPersistOp::Delete { id: EntryId(1) };
+    let op2 = op.clone();
+    let _ = format!("{op2:?}");
+}
 
 fn prepare_db_dir() -> PathBuf {
     let fmt_layer = fmt::layer().with_target(false);
@@ -61,13 +205,13 @@ async fn test_db(db: &mut DbSqlite) -> Result<()> {
 
     let data = build_content(&[("text/plain", "content")]);
 
-    db.insert_with_time(data.clone(), 10).await.unwrap();
+    db.insert_with_time(data.clone(), TimestampMillis(10)).await.unwrap();
 
     assert!(db.len() == 1);
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    db.insert_with_time(data.clone(), 20).await.unwrap();
+    db.insert_with_time(data.clone(), TimestampMillis(20)).await.unwrap();
 
     assert!(db.len() == 1);
 
@@ -75,7 +219,7 @@ async fn test_db(db: &mut DbSqlite) -> Result<()> {
 
     let data2 = build_content(&[("text/plain", "content2")]);
 
-    db.insert_with_time(data2.clone(), 30).await.unwrap();
+    db.insert_with_time(data2.clone(), TimestampMillis(30)).await.unwrap();
 
     assert_eq!(db.len(), 2);
 
@@ -152,17 +296,17 @@ async fn favorites() {
     let now1 = 1000i64;
     let id1 = EntryId(now1);
     let data1 = build_content(&[("text/plain", "content1")]);
-    db.insert_with_time(data1, now1).await.unwrap();
+    db.insert_with_time(data1, TimestampMillis(now1)).await.unwrap();
 
     let now2 = 2000i64;
     let id2 = EntryId(now2);
     let data2 = build_content(&[("text/plain", "content2")]);
-    db.insert_with_time(data2, now2).await.unwrap();
+    db.insert_with_time(data2, TimestampMillis(now2)).await.unwrap();
 
     let now3 = 3000i64;
     let id3 = EntryId(now3);
     let data3 = build_content(&[("text/plain", "content3")]);
-    db.insert_with_time(data3.clone(), now3).await.unwrap();
+    db.insert_with_time(data3.clone(), TimestampMillis(now3)).await.unwrap();
 
     db.add_favorite(id3, None).await.unwrap();
 
@@ -173,7 +317,7 @@ async fn favorites() {
 
     assert_eq!(db.favorites.len(), 0);
 
-    db.insert_with_time(data3.clone(), now3).await.unwrap();
+    db.insert_with_time(data3.clone(), TimestampMillis(now3)).await.unwrap();
 
     db.add_favorite(id1, None).await.unwrap();
 
@@ -221,19 +365,19 @@ async fn lock() {
 
     let now1 = 1000;
     let data1 = build_content(&[("text/plain", "content1")]);
-    db1.insert_with_time(data1, now1).await.unwrap();
+    db1.insert_with_time(data1, TimestampMillis(now1)).await.unwrap();
 
     let now2 = 2000;
     let data2 = build_content(&[("text/plain", "content2")]);
-    db1.insert_with_time(data2, now2).await.unwrap();
+    db1.insert_with_time(data2, TimestampMillis(now2)).await.unwrap();
 
     let now3 = 3000;
     let data3 = build_content(&[("text/plain", "content3")]);
-    db1.insert_with_time(data3.clone(), now3).await.unwrap();
+    db1.insert_with_time(data3.clone(), TimestampMillis(now3)).await.unwrap();
 
     let now4 = 4000;
     let data4 = build_content(&[("text/plain", "content3")]);
-    db2.insert_with_time(data4.clone(), now4).await.unwrap();
+    db2.insert_with_time(data4.clone(), TimestampMillis(now4)).await.unwrap();
 
     assert_eq!(db1.len(), 3);
     assert_eq!(db2.len(), 0);
@@ -270,4 +414,74 @@ async fn bench_search_from_system_path() {
     db.set_query_and_search("a".into());
 
     println!("Elapsed: {:?}", now.elapsed());
+}
+
+// ── insert_to_memory / delete_from_memory / clear_memory ────────────
+
+#[tokio::test]
+#[serial]
+async fn test_insert_to_memory_returns_persist_op() {
+    let db_dir = prepare_db_dir();
+    let mut db = DbSqlite::with_path(&Config::default(), &db_dir)
+        .await
+        .unwrap();
+    let data = build_content(&[("text/plain", "memory test")]);
+    let op = db.insert_to_memory(data);
+    assert!(op.is_some(), "insert_to_memory should return Some(InsertNew)");
+    assert!(matches!(op.unwrap(), DbPersistOp::InsertNew { .. }));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_insert_to_memory_dedup_returns_update_timestamp() {
+    let db_dir = prepare_db_dir();
+    let mut db = DbSqlite::with_path(&Config::default(), &db_dir)
+        .await
+        .unwrap();
+    let data = build_content(&[("text/plain", "dup test")]);
+    let _ = db.insert_to_memory(data.clone());
+    let op = db.insert_to_memory(data);
+    assert!(op.is_some());
+    assert!(matches!(op.unwrap(), DbPersistOp::UpdateTimestamp { .. }));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_delete_from_memory_returns_persist_op() {
+    let db_dir = prepare_db_dir();
+    let mut db = DbSqlite::with_path(&Config::default(), &db_dir)
+        .await
+        .unwrap();
+    let data = build_content(&[("text/plain", "to delete")]);
+    db.insert(data).await.unwrap();
+    let first_id = db.iter().next().expect("should have an entry").id();
+    let op = db.delete_from_memory(first_id);
+    assert!(op.is_some());
+    assert!(matches!(op.unwrap(), DbPersistOp::Delete { .. }));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_delete_from_memory_missing_returns_none() {
+    let db_dir = prepare_db_dir();
+    let mut db = DbSqlite::with_path(&Config::default(), &db_dir)
+        .await
+        .unwrap();
+    let op = db.delete_from_memory(EntryId(99999));
+    assert!(op.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_clear_memory_returns_persist_op() {
+    let db_dir = prepare_db_dir();
+    let mut db = DbSqlite::with_path(&Config::default(), &db_dir)
+        .await
+        .unwrap();
+    db.insert(build_content(&[("text/plain", "a")])).await.unwrap();
+    db.insert(build_content(&[("text/plain", "b")])).await.unwrap();
+    let op = db.clear_memory();
+    assert!(op.is_some());
+    assert!(matches!(op.unwrap(), DbPersistOp::ClearNonFavorites));
+    assert_eq!(db.len(), 0);
 }
