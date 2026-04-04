@@ -47,6 +47,7 @@ libc = "0.2"
 nix = { version = "0.29", features = ["fs", "process"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 misanthropy = "0.0.8"
+wl-clipboard-rs = "0.9"
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"

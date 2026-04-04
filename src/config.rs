@@ -35,7 +35,7 @@ pub struct Config {
     pub unique_session: bool,
     /// Enable the selection buffer (replaces sync_primary_selection)
     pub selection_buffer_enabled: bool,
-    /// When selection buffer is enabled, also copy selected text to clipboard via wl-copy
+    /// When selection buffer is enabled, also copy selected text to the clipboard
     pub selection_buffer_sync_clipboard: bool,
     /// Maximum entries in the selection buffer
     pub selection_buffer_max_entries: u32,
@@ -45,7 +45,7 @@ pub struct Config {
 
 pub static PRIVATE_MODE: AtomicBool = AtomicBool::new(false);
 pub static SELECTION_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Set to true just before wl-copy from primary selection sync.
+/// Set to true just before copying from primary selection sync.
 /// The regular clipboard handler checks this flag and skips DB insert if set.
 pub static SKIP_NEXT_CLIPBOARD: AtomicBool = AtomicBool::new(false);
 

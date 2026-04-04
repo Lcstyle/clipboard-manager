@@ -67,22 +67,17 @@ fn spawn_db_persist(db_path: &str, op: crate::db::DbPersistOp) -> Task<AppMsg> {
     )
 }
 
-/// Spawn `wl-copy --type <mime>` and pipe `data` into its stdin.
-fn wl_copy(mime: &str, data: &[u8]) -> Result<(), std::io::Error> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("wl-copy")
-        .arg("--type")
-        .arg(mime)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(data)?;
-    }
-    child.wait()?;
-    Ok(())
+/// Copy data to the Wayland clipboard via the wlr-data-control protocol.
+///
+/// Uses `wl-clipboard-rs` to write directly to the compositor, avoiding the
+/// need for an external `wl-copy` process. A background thread is spawned
+/// internally to serve paste requests — this is expected Wayland behavior.
+fn wl_copy(mime: &str, data: &[u8]) -> Result<(), wl_clipboard_rs::copy::Error> {
+    use wl_clipboard_rs::copy::{MimeType, Options, Source};
+    Options::new().copy(
+        Source::Bytes(data.into()),
+        MimeType::Specific(mime.to_string()),
+    )
 }
 
 /// Tracks the editor subprocess spawned by the applet.
@@ -757,7 +752,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
             AppMsg::DbusCopyEntry { id, reply } => {
                 match self.db.get_from_id(id) {
                     Some(entry) => {
-                        // Use wl-copy (zwlr_data_control) instead of copy_iced (wl_data_device)
+                        // Use wl_copy (zwlr_data_control) instead of copy_iced (wl_data_device)
                         // because the applet may not have Wayland focus when called via D-Bus.
                         let raw = entry.raw_content();
                         // Prefer text/plain, fall back to first available MIME type
@@ -774,8 +769,8 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                                 reply.reply(Ok(()));
                             }
                             Err(e) => {
-                                error!("wl-copy failed: {e}");
-                                reply.reply(Err(format!("wl-copy failed: {e}")));
+                                error!("clipboard copy failed: {e}");
+                                reply.reply(Err(format!("clipboard copy failed: {e}")));
                             }
                         }
                     }
@@ -840,7 +835,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                     self.clipboard_state = ClipboardState::Connected;
                 }
                 clipboard::ClipboardMessage::Data(data) => {
-                    // Check if this clipboard event came from primary selection sync (wl-copy).
+                    // Check if this clipboard event came from primary selection sync.
                     // If so, skip DB insert — the text is already in the selection buffer.
                     if SKIP_NEXT_CLIPBOARD.compare_exchange(
                         true,
@@ -900,18 +895,18 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                                     // Set skip flag so the regular watcher doesn't persist to DB
                                     SKIP_NEXT_CLIPBOARD.store(true, atomic::Ordering::Release);
 
-                                    // Copy to clipboard via wl-copy for immediate Ctrl+V
+                                    // Copy to clipboard for immediate Ctrl+V
                                     if let Err(e) = wl_copy("text/plain", text_data) {
                                         // Clear skip flag on failure
                                         SKIP_NEXT_CLIPBOARD.store(false, atomic::Ordering::Release);
-                                        error!("primary sync: wl-copy failed: {e}");
+                                        error!("primary sync: clipboard copy failed: {e}");
                                     }
                                 }
-                                // If sync_clipboard is false, text only goes to buffer (no wl-copy)
+                                // If sync_clipboard is false, text only goes to buffer (no copy)
                             } else {
-                                // Selection buffer disabled — old behavior: just wl-copy to clipboard
+                                // Selection buffer disabled — old behavior: copy to clipboard
                                 if let Err(e) = wl_copy("text/plain", text_data) {
-                                    error!("primary sync: wl-copy failed: {e}");
+                                    error!("primary sync: clipboard copy failed: {e}");
                                 }
                             }
                         }
@@ -1233,7 +1228,7 @@ impl<Db: DbTrait + 'static> cosmic::Application for AppState<Db> {
                 if let Some(entry) = self.selection_buffer.get_by_id(id) {
                     let text_data = entry.text.as_bytes().to_vec();
                     if let Err(e) = wl_copy("text/plain", &text_data) {
-                        error!("selection copy: wl-copy failed: {e}");
+                        error!("selection copy: clipboard copy failed: {e}");
                     }
                 }
                 // Do NOT close popup — multi-grab workflow
